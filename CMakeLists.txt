@@ -673,6 +673,9 @@ endif()
 message("FINAL CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
 
 if(${BOLT_ENABLE_GPU})
+  # nvcc has no C++23 dialect, so CUDA must not inherit the C++ standard.
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED True)
   enable_language(CUDA)
   # Determine CUDA_ARCHITECTURES automatically.
   cmake_policy(SET CMP0104 NEW)

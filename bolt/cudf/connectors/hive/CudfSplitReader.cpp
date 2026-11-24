@@ -23,7 +23,7 @@
 #include "bolt/common/caching/CacheTTLController.h"
 #include "bolt/common/file/FileSystems.h"
 #include "bolt/common/time/Timer.h"
-#include "bolt/connectors/common/BufferedInputBuilder.h"
+#include "bolt/connectors/hive/HiveConnectorUtil.h"
 #include "bolt/connectors/hive/FileHandle.h"
 #include "bolt/connectors/hive/HiveConfig.h"
 #include "bolt/connectors/hive/HiveConnectorSplit.h"
@@ -192,7 +192,6 @@ CudfSplitReader::CudfSplitReader(
     const ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
     const std::shared_ptr<io::IoStatistics>& ioStatistics,
-    const std::shared_ptr<IoStats>& ioStats,
     const cudf::ast::expression* subfieldFilterAst)
     : NvtxHelper(
           nvtx3::rgb{80, 171, 241},
@@ -207,7 +206,6 @@ CudfSplitReader::CudfSplitReader(
       executor_(executor),
       connectorQueryCtx_(connectorQueryCtx),
       ioStatistics_(ioStatistics),
-      ioStats_(ioStats),
       cudfHiveConfig_(cudfHiveConfig),
       pool_(connectorQueryCtx->memoryPool()),
       baseReaderOpts_(pool_),
@@ -227,9 +225,6 @@ CudfSplitReader::CudfSplitReader(
     }
   }
   BOLT_DCHECK_EQ(readColumnNames_.size(), readColumnTypes_.size());
-  baseReaderOpts_.setDataIoStats(ioStatistics_);
-  baseReaderOpts_.setMetadataIoStats(ioStatistics_);
-
   // The cuDF path doesn't use connector::hive::configureReaderOptions() to
   // apply configurations so load-quantum, max-coalesced-bytes and
   // max-coalesced-distance-bytes are applied here so a tuned load-quantum
@@ -237,7 +232,7 @@ CudfSplitReader::CudfSplitReader(
   const ::bytedance::bolt::connector::hive::HiveConfig hiveConfig(
       cudfHiveConfig_->config());
   const auto* sessionProperties = connectorQueryCtx_->sessionProperties();
-  baseReaderOpts_.setLoadQuantum(hiveConfig.loadQuantum(sessionProperties));
+  baseReaderOpts_.setLoadQuantum(hiveConfig.loadQuantum());
   baseReaderOpts_.setMaxCoalesceBytes(
       hiveConfig.maxCoalescedBytes(sessionProperties));
   baseReaderOpts_.setMaxCoalesceDistance(
@@ -617,28 +612,18 @@ void CudfSplitReader::setupCudfDataSource() {
     return;
   }
 
-  auto fileHandleCachePtr = FileHandleCachedPtr{};
+  std::shared_ptr<FileHandle> fileHandleCachePtr;
   try {
-    const auto fileHandleKey = FileHandleKey{
-        .filename = split_->filePath,
-        .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
-    auto fileProperties = split_->properties.value_or(FileProperties{});
-    // The size can also come from the $file_size info column.
-    fileProperties.fileSize = split_->fileSize();
-    fileHandleCachePtr = fileHandleFactory_->generate(
-        fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
+    fileHandleCachePtr =
+        fileHandleFactory_
+            ->generate(split_->filePath, filesystems::FileOptions{})
+            .second;
     BOLT_CHECK_NOT_NULL(fileHandleCachePtr.get());
   } catch (const BoltRuntimeError& e) {
     if (ignoreMissingFiles) {
       if (e.errorCode() == error_code::kFileNotFound) {
         markSplitEmpty();
         return;
-      }
-      // Rethrow actual filesystem errors only. Unsupported paths may fall back
-      // to KvikIO.
-      if (filesystems::isPathSupportedByRegisteredFileSystems(
-              split_->filePath)) {
-        throw;
       }
     }
     // ABFS blobs can not fall back to KvikIO. Throw the original error.
@@ -667,14 +652,16 @@ void CudfSplitReader::setupCudfDataSource() {
     cacheTTLController->addOpenFileInfo(fileHandleCachePtr->uuid.id());
   }
 
-  auto bufferedInput =
-      bolt::connector::BufferedInputBuilder::getInstance()->create(
-          *fileHandleCachePtr,
-          baseReaderOpts_,
-          connectorQueryCtx_,
-          ioStatistics_,
-          ioStats_,
-          executor_);
+  std::vector<int> columnCacheBlackList;
+  auto bufferedInput = ::bytedance::bolt::connector::hive::createBufferedInput(
+      *fileHandleCachePtr,
+      baseReaderOpts_,
+      connectorQueryCtx_,
+      ioStatistics_,
+      executor_,
+      /*judgeCache=*/false,
+      columnCacheBlackList,
+      /*hiveConnectorSplitCacheLimit=*/nullptr);
   if (not bufferedInput) {
     // ABFS blobs can not fall back to KvikIO
     if (isAbfsPath(split_->filePath)) {
@@ -889,7 +876,7 @@ void CudfSplitReader::totalScanTimeCalculator(void* userData) {
   auto elapsedNs = elapsedUs * 1000; // Convert microseconds to nanoseconds
 
   // Update totalScanTime
-  data->ioStatistics->incTotalScanTimeNs(elapsedNs);
+  data->ioStatistics->incTotalScanTime(elapsedNs);
 
   delete data;
 }

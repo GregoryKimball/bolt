@@ -108,7 +108,13 @@ std::shared_ptr<CudfHiveConnectorSplit> CudfHiveConnectorSplit::create(
   std::optional<FileProperties> properties;
   const auto& propertiesObj = obj.getDefault("properties", nullptr);
   if (propertiesObj != nullptr) {
-    properties = FileProperties::create(propertiesObj);
+    properties = FileProperties{};
+    if (const auto* size = propertiesObj.get_ptr("fileSize")) {
+      properties->fileSize = size->asInt();
+    }
+    if (const auto* time = propertiesObj.get_ptr("modificationTime")) {
+      properties->modificationTime = time->asInt();
+    }
   }
 
   return std::make_shared<CudfHiveConnectorSplit>(
@@ -144,7 +150,14 @@ folly::dynamic CudfHiveConnectorSplit::serialize() const {
   obj["partitionKeys"] = partitionKeysObj;
 
   if (properties.has_value()) {
-    obj["properties"] = properties->serialize();
+    folly::dynamic propertiesObj = folly::dynamic::object;
+    if (properties->fileSize.has_value()) {
+      propertiesObj["fileSize"] = *properties->fileSize;
+    }
+    if (properties->modificationTime.has_value()) {
+      propertiesObj["modificationTime"] = *properties->modificationTime;
+    }
+    obj["properties"] = propertiesObj;
   }
 
   return obj;

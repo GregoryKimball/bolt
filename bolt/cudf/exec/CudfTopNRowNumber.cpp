@@ -35,6 +35,9 @@ namespace bytedance::bolt::cudf_velox {
 
 namespace {
 
+// Bolt's TopNRowNumberNode only computes row_number.
+enum class RankFunction { kRowNumber, kRank, kDenseRank };
+
 cudf::table_view makePartitionKeys(
     cudf::table_view sortedView,
     const std::vector<cudf::size_type>& partitionKeyIndices,
@@ -56,13 +59,13 @@ std::unique_ptr<cudf::column> computeRanks(
     cudf::table_view view,
     const std::vector<cudf::size_type>& partitionKeyIndices,
     const std::vector<cudf::size_type>& sortKeyIndices,
-    core::TopNRowNumberNode::RankFunction rankFunction,
+    RankFunction rankFunction,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   std::unique_ptr<cudf::column> singlePartitionCol;
   auto partKeys = makePartitionKeys(
       view, partitionKeyIndices, stream, mr, singlePartitionCol);
-  if (rankFunction == core::TopNRowNumberNode::RankFunction::kRowNumber) {
+  if (rankFunction == RankFunction::kRowNumber) {
     auto rowNumberAggregation =
         cudf::make_row_number_aggregation<cudf::rolling_aggregation>();
     return cudf::grouped_rolling_window(
@@ -100,7 +103,7 @@ std::unique_ptr<cudf::column> computeRanks(
   requests[0].values = rankValues;
   requests[0].aggregations.push_back(
       cudf::make_rank_aggregation<cudf::groupby_scan_aggregation>(
-          rankFunction == core::TopNRowNumberNode::RankFunction::kRank
+          rankFunction == RankFunction::kRank
               ? cudf::rank_method::MIN
               : cudf::rank_method::DENSE,
           cudf::order::ASCENDING,
@@ -127,7 +130,7 @@ std::unique_ptr<cudf::column> makeLimitMask(
 }
 
 bool supportsRankKey(const TypePtr& type, bool sortingKey) {
-  if (type->providesCustomComparison() ||
+  if (false ||
       (sortingKey && (type->isArray() || type->isMap()))) {
     return false;
   }
@@ -142,11 +145,11 @@ bool supportsRankKey(const TypePtr& type, bool sortingKey) {
 } // namespace
 
 bool CudfTopNRowNumber::canRunOnGPU(const core::TopNRowNumberNode& node) {
-  switch (node.rankFunction()) {
-    case core::TopNRowNumberNode::RankFunction::kRowNumber:
+  switch (RankFunction::kRowNumber) {
+    case RankFunction::kRowNumber:
       return true;
-    case core::TopNRowNumberNode::RankFunction::kRank:
-    case core::TopNRowNumberNode::RankFunction::kDenseRank:
+    case RankFunction::kRank:
+    case RankFunction::kDenseRank:
       break;
     default:
       return false;
@@ -246,7 +249,7 @@ CudfVectorPtr CudfTopNRowNumber::reduceBatchToLocalCandidates(
       sortedKeyTable->view(),
       localPartitionKeyIndices_,
       localSortKeyIndices_,
-      node_->rankFunction(),
+      RankFunction::kRowNumber,
       stream,
       mr);
   auto mask = makeLimitMask(*ranks, limit_, stream, mr);
@@ -295,7 +298,7 @@ CudfVectorPtr CudfTopNRowNumber::mergeAndPruneCandidates(
       merged->view(),
       partitionKeyIndices_,
       sortKeyIndices_,
-      node_->rankFunction(),
+      RankFunction::kRowNumber,
       stream,
       mr);
   auto mask = makeLimitMask(*ranks, limit_, stream, mr);
@@ -361,7 +364,7 @@ RowVectorPtr CudfTopNRowNumber::doGetOutput() {
       candidates_->getTableView(),
       partitionKeyIndices_,
       sortKeyIndices_,
-      node_->rankFunction(),
+      RankFunction::kRowNumber,
       stream,
       mr);
   // cuDF ranks are int32; Velox expects bigint.

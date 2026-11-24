@@ -141,7 +141,8 @@ bool sortingKeysSupportedByCudf(
   // A function the CPU registry does not know counts as order sensitive.
   const auto* entry =
       exec::getAggregateFunctionEntry(getOriginalName(aggregate.call->name()));
-  return entry != nullptr && !entry->metadata.orderSensitive;
+  // Bolt's registry has no order-sensitivity metadata.
+  return false;
 }
 
 namespace {
@@ -395,9 +396,8 @@ bool matchTypedCallAgainstSignatures(
     argTypes.push_back(input->type());
   }
   for (const auto& sig : sigs) {
-    std::vector<Coercion> coercions(n);
-    exec::SignatureBinder binder(*sig, argTypes, TypeCoercer::defaults());
-    if (!binder.tryBindWithCoercions(coercions)) {
+    exec::SignatureBinder binder(*sig, argTypes);
+    if (!binder.tryBind()) {
       continue;
     }
 

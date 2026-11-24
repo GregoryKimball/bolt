@@ -80,7 +80,6 @@ class CudfSplitReader : public NvtxHelper {
       const ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
-      const std::shared_ptr<IoStats>& ioStats,
       const cudf::ast::expression* subfieldFilterAst);
 
   virtual ~CudfSplitReader();
@@ -198,7 +197,6 @@ class CudfSplitReader : public NvtxHelper {
   const ConnectorQueryCtx* connectorQueryCtx_;
 
   std::shared_ptr<io::IoStatistics> ioStatistics_;
-  std::shared_ptr<IoStats> ioStats_;
 
   cuda::stream_ref stream_{cudaStream_t{cudaStreamDefault}};
 

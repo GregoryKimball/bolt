@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "bolt/common/caching/FileProperties.h"
+#include "bolt/connectors/hive/FileProperties.h"
 #include "bolt/connectors/Connector.h"
 #include "bolt/dwio/common/Options.h"
 
@@ -80,7 +80,7 @@ struct CudfHiveConnectorSplit
     return *cudfSourceInfo;
   }
 
-  uint64_t size() const override;
+  uint64_t size() const;
 
   folly::dynamic serialize() const override;
 

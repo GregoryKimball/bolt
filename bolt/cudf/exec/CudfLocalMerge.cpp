@@ -127,8 +127,7 @@ bool CudfLocalMerge::drainSources() {
     while (true) {
       RowVectorPtr data;
       ContinueFuture future;
-      bool drained = false;
-      auto reason = sources_[i]->next(data, &future, drained);
+      auto reason = sources_[i]->next(data, &future);
 
       if (reason != exec::BlockingReason::kNotBlocked) {
         blockingFutures_.push_back(std::move(future));

@@ -31,7 +31,6 @@
 #include "bolt/expression/FunctionSignature.h"
 #include "bolt/expression/SignatureBinder.h"
 #include "bolt/type/DecimalUtil.h"
-#include "bolt/type/Time.h"
 #include "bolt/type/Type.h"
 #include "bolt/vector/BaseVector.h"
 #include "bolt/vector/ComplexVector.h"
@@ -246,7 +245,7 @@ static bool matchCallAgainstSignatures(
     argTypes.push_back(in->type());
   }
   for (const auto& sig : sigs) {
-    exec::SignatureBinder binder(*sig, argTypes, TypeCoercer::defaults());
+    exec::SignatureBinder binder(*sig, argTypes);
     if (!binder.tryBind()) {
       continue;
     }
@@ -332,7 +331,7 @@ const CudfExpressionEvaluatorEntry* findBestEvaluator(
 // that spells no value of the target type; a TRY_CAST gives NULL instead.
 bool containsFailingCastFromVarchar(const core::TypedExprPtr& expr) {
   if (expr->isCastKind() &&
-      !expr->asUnchecked<core::CastTypedExpr>()->isTryCast() &&
+      !expr->asUnchecked<core::CastTypedExpr>()->nullOnFailure() &&
       !expr->inputs().empty() && expr->inputs()[0]->type()->isVarchar()) {
     return true;
   }
@@ -934,7 +933,7 @@ class CastFunction : public CudfFunction {
           sourceType->toString(),
           expr->type()->toString());
       isTryCast_ = expr->isCastKind() &&
-          expr->asUnchecked<core::CastTypedExpr>()->isTryCast();
+          expr->asUnchecked<core::CastTypedExpr>()->nullOnFailure();
       targetTypeName_ = expr->type()->toString();
       if (cudf::is_integral_not_bool(targetCudfType_)) {
         integralUdf_ = makePrestoIntegralUdf(targetCudfType_);
@@ -2949,7 +2948,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .typeVariable("T")
            .returnType("T")
            .argumentType("T")
-           .variableArity("T")
+           .argumentType("T").variableArity()
            .build()});
 
   // row_constructor is a special form and doesn't have a prefix in its name.
@@ -2975,7 +2974,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("boolean")
            .argumentType("boolean")
-           .variableArity("boolean")
+           .argumentType("boolean").variableArity()
            .build()});
 
   registerCudfFunction(
@@ -2990,7 +2989,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("boolean")
            .argumentType("boolean")
-           .variableArity("boolean")
+           .argumentType("boolean").variableArity()
            .build()});
 
   registerCudfFunction(
@@ -3318,7 +3317,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("varchar")
            .argumentType("varchar")
-           .variableArity("varchar")
+           .argumentType("varchar").variableArity()
            .build()});
 
   // No prefix because switch and if are special forms. Only the two-argument
@@ -3576,14 +3575,14 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("double")
            .argumentType("double")
-           .variableArity("double")
+           .argumentType("double").variableArity()
            .build(),
        FunctionSignatureBuilder()
            .integerVariable("p")
            .integerVariable("s")
            .returnType("decimal(p,s)")
            .argumentType("decimal(p,s)")
-           .variableArity("decimal(p,s)")
+           .argumentType("decimal(p,s)").variableArity()
            .build()});
 
   registerCudfFunction(
@@ -3598,14 +3597,14 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("double")
            .argumentType("double")
-           .variableArity("double")
+           .argumentType("double").variableArity()
            .build(),
        FunctionSignatureBuilder()
            .integerVariable("p")
            .integerVariable("s")
            .returnType("decimal(p,s)")
            .argumentType("decimal(p,s)")
-           .variableArity("decimal(p,s)")
+           .argumentType("decimal(p,s)").variableArity()
            .build()});
 
   // Note: Spark and Presto functions are now registered separately via
@@ -3621,7 +3620,7 @@ std::string exprRegistryName(const core::TypedExprPtr& expr) {
     case core::ExprKind::kCall:
       return expr->asUnchecked<core::CallTypedExpr>()->name();
     case core::ExprKind::kCast:
-      return expr->asUnchecked<core::CastTypedExpr>()->isTryCast()
+      return expr->asUnchecked<core::CastTypedExpr>()->nullOnFailure()
           ? expression::kTryCast
           : expression::kCast;
     case core::ExprKind::kConcat:
@@ -4144,7 +4143,7 @@ bool requiresCpuForCastConfig(
         "under legacy_cast");
     return true;
   }
-  if (config.isCastStringToFloatingPointLenientInfNan() &&
+  if (false &&
       containsCastFromVarchar(expr, /*floatingPointOnly=*/true)) {
     LOG_FALLBACK(
         "A cast from VARCHAR to REAL or DOUBLE stays on the CPU under "

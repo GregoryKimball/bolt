@@ -28,15 +28,11 @@
 #include "bolt/cudf/vector/CudfVector.h"
 
 #include "bolt/common/Casts.h"
-#include "bolt/common/io/IoStatisticsRuntimeStats.h"
 #include "bolt/common/time/Timer.h"
-#include "bolt/connectors/common/FileColumnHandle.h"
-#include "bolt/connectors/common/FileConnectorUtil.h"
-#include "bolt/connectors/common/FileSplitReader.h"
-#include "bolt/connectors/common/PartitionValue.h"
 #include "bolt/connectors/hive/FileHandle.h"
 #include "bolt/connectors/hive/HiveConfig.h"
 #include "bolt/connectors/hive/HiveConnectorSplit.h"
+#include "bolt/connectors/hive/HiveConnectorUtil.h"
 #include "bolt/connectors/hive/TableHandle.h"
 #include "bolt/core/Expressions.h"
 #include "bolt/core/QueryCtx.h"
@@ -212,56 +208,23 @@ bool isTrueConstant(
       constant.toConstantVector(pool)->as<ConstantVector<bool>>()->valueAt(0);
 }
 
-// Returns whether a pushed-down filter accepts a partition key value, which
-// is NULL when absent.
+// Bolt's Hive connector has no partition value parser the data source can
+// share, so partition keys are not supported.
 bool testPartitionKeyFilter(
-    const common::Filter& filter,
-    const TypePtr& type,
-    const std::optional<std::string>& value,
-    bool dateValueDaysSinceEpoch,
-    bool timestampValueAsLocalTime) {
-  if (!value.has_value()) {
-    return filter.testNull();
-  }
-  return common::applyFilter(
-      filter,
-      ::bytedance::bolt::connector::PartitionValue::fromString(
-          *value,
-          *type,
-          timestampValueAsLocalTime
-              ? ::bytedance::bolt::connector::PartitionValue::TimestampMode::
-                    kLocalTime
-              : ::bytedance::bolt::connector::PartitionValue::TimestampMode::
-                    kUtc,
-          dateValueDaysSinceEpoch
-              ? ::bytedance::bolt::connector::PartitionValue::DateMode::
-                    kDaysSinceEpoch
-              : ::bytedance::bolt::connector::PartitionValue::DateMode::
-                    kIsoString));
+    const common::Filter& /*filter*/,
+    const TypePtr& /*type*/,
+    const std::optional<std::string>& /*value*/,
+    bool /*dateValueDaysSinceEpoch*/,
+    bool /*timestampValueAsLocalTime*/) {
+  BOLT_NYI("Partition keys are not supported by the cuDF Hive data source");
 }
 
-// A connector sees the session time zone settings but not the session
-// QueryConfig. As a workaround, the remaining filter is folded and compiled
-// against a local QueryCtx with only those settings, and a filter that depends
-// on another setting runs on the CPU data source.
-// TODO: Remove the workaround once ConnectorQueryCtx exposes the session
-// QueryConfig (facebookincubator/velox#19476) and expression::optimize can fold
-// through the session's evaluator (facebookincubator/velox#17898).
-// NOTE: A setting left at its default can still change a fold, such as how
-// TIMESTAMP WITH TIME ZONE renders as VARCHAR.
+// The remaining filter is folded and compiled against a QueryCtx with the
+// session QueryConfig.
 std::shared_ptr<core::QueryCtx> makeRemainingFilterQueryCtx(
-    const ConnectorQueryCtx& connectorQueryCtx) {
-  std::unordered_map<std::string, std::string> sessionSettings{
-      {core::QueryConfig::kAdjustTimestampToTimezone,
-       connectorQueryCtx.adjustTimestampToTimezone() ? "true" : "false"}};
-  // An empty time zone is not a valid setting; leaving it unset means UTC.
-  if (!connectorQueryCtx.sessionTimezone().empty()) {
-    sessionSettings.emplace(
-        core::QueryConfig::kSessionTimezone,
-        connectorQueryCtx.sessionTimezone());
-  }
+    const core::QueryConfig& queryConfig) {
   return core::QueryCtx::create(
-      nullptr, core::QueryConfig{std::move(sessionSettings)});
+      nullptr, core::QueryConfig{queryConfig.rawConfigsCopy()});
 }
 
 // Returns whether the remaining filter depends on a session setting the local
@@ -310,7 +273,7 @@ ScanFilters splitAndFoldFilters(
 
   // Extract single-column filters like "col = 'X'" or "col <> 'Y'" from the
   // remaining filter into subfield filters, as the CPU data source does.
-  filters.sampleRate = tableHandle.sampleRate();
+  filters.sampleRate = 1.0;
   const auto remainingFilter =
       bytedance::bolt::connector::extractFiltersFromRemainingFilter(
           tableHandle.remainingFilter(),
@@ -378,14 +341,17 @@ std::optional<std::string> unsupportedFiltersReason(
 } // namespace
 
 bool CudfHiveDataSource::isSupported(
-    const ConnectorTableHandlePtr& tableHandle,
-    const ConnectorQueryCtx& connectorQueryCtx) {
-  return !unsupportedReason(tableHandle, connectorQueryCtx).has_value();
+    const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+    const ConnectorQueryCtx& connectorQueryCtx,
+    const core::QueryConfig& queryConfig) {
+  return !unsupportedReason(tableHandle, connectorQueryCtx, queryConfig)
+              .has_value();
 }
 
 std::optional<std::string> CudfHiveDataSource::unsupportedReason(
-    const ConnectorTableHandlePtr& tableHandle,
-    const ConnectorQueryCtx& connectorQueryCtx) {
+    const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+    const ConnectorQueryCtx& connectorQueryCtx,
+    const core::QueryConfig& queryConfig) {
   auto hiveTableHandle =
       std::dynamic_pointer_cast<const HiveTableHandle>(tableHandle);
   if (!hiveTableHandle) {
@@ -394,7 +360,7 @@ std::optional<std::string> CudfHiveDataSource::unsupportedReason(
         tableHandle->toString());
   }
 
-  const auto queryCtx = makeRemainingFilterQueryCtx(connectorQueryCtx);
+  const auto queryCtx = makeRemainingFilterQueryCtx(queryConfig);
   const auto filters = splitAndFoldFilters(
       *hiveTableHandle,
       connectorQueryCtx.expressionEvaluator(),
@@ -405,11 +371,12 @@ std::optional<std::string> CudfHiveDataSource::unsupportedReason(
 
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
-    const ConnectorTableHandlePtr& tableHandle,
-    const ColumnHandleMap& columnHandles,
+    const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+    const std::unordered_map<std::string, std::shared_ptr<::bytedance::bolt::connector::ColumnHandle>>& columnHandles,
     bytedance::bolt::FileHandleFactory* fileHandleFactory,
     folly::Executor* executor,
-    const ConnectorQueryCtx* connectorQueryCtx,
+    const std::shared_ptr<ConnectorQueryCtx>& connectorQueryCtx,
+    const core::QueryConfig& queryConfig,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig)
     : CudfHiveDataSource(
           outputType,
@@ -418,16 +385,18 @@ CudfHiveDataSource::CudfHiveDataSource(
           fileHandleFactory,
           executor,
           connectorQueryCtx,
+          queryConfig,
           cudfHiveConfig,
           PartitionKeySource::kDataSource) {}
 
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
-    const ConnectorTableHandlePtr& tableHandle,
-    const ColumnHandleMap& columnHandles,
+    const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+    const std::unordered_map<std::string, std::shared_ptr<::bytedance::bolt::connector::ColumnHandle>>& columnHandles,
     bytedance::bolt::FileHandleFactory* fileHandleFactory,
     folly::Executor* executor,
-    const ConnectorQueryCtx* connectorQueryCtx,
+    const std::shared_ptr<ConnectorQueryCtx>& connectorQueryCtx,
+    const core::QueryConfig& queryConfig,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
     PartitionKeySource partitionKeySource)
     : NvtxHelper(
@@ -437,7 +406,8 @@ CudfHiveDataSource::CudfHiveDataSource(
       cudfHiveConfig_(cudfHiveConfig),
       fileHandleFactory_(fileHandleFactory),
       executor_(executor),
-      connectorQueryCtx_(connectorQueryCtx),
+      connectorQueryCtxHolder_(connectorQueryCtx),
+      connectorQueryCtx_(connectorQueryCtx.get()),
       outputType_(outputType),
       pool_(connectorQueryCtx->memoryPool()),
       expressionEvaluator_(connectorQueryCtx->expressionEvaluator()),
@@ -451,39 +421,37 @@ CudfHiveDataSource::CudfHiveDataSource(
   // the filters read.
   std::unordered_map<
       std::string,
-      const ::bytedance::bolt::connector::FileColumnHandle*>
+      const hive::HiveColumnHandle*>
       columnHandlesByName;
   for (const auto& [_, handle] : columnHandles) {
     const auto* fileColumnHandle =
         checkedPointerCast<
-            const ::bytedance::bolt::connector::FileColumnHandle>(handle)
+            const hive::HiveColumnHandle>(handle)
             .get();
     columnHandlesByName.emplace(fileColumnHandle->name(), fileColumnHandle);
-  }
-  for (const auto& handle : tableHandle_->hiveFilterColumnHandles()) {
-    columnHandlesByName.emplace(handle->name(), handle.get());
   }
 
   // Returns the handle of a partition key the data source resolves, or null.
   const auto partitionKeyHandle = [&](const std::string& name)
-      -> const ::bytedance::bolt::connector::FileColumnHandle* {
+      -> const hive::HiveColumnHandle* {
     if (partitionKeySource_ != PartitionKeySource::kDataSource) {
       return nullptr;
     }
     const auto it = columnHandlesByName.find(name);
-    return it != columnHandlesByName.end() && it->second->isPartitionKey()
+    return it != columnHandlesByName.end() && it->second->columnType() ==
+            hive::HiveColumnHandle::ColumnType::kPartitionKey
         ? it->second
         : nullptr;
   };
   const auto addPartitionKey =
       [&](const std::string& name,
           const TypePtr& type,
-          const ::bytedance::bolt::connector::FileColumnHandle& handle) {
+          const hive::HiveColumnHandle& handle) {
         if (partitionKeys_
                 .emplace(
                     name,
                     PartitionKey{
-                        type, handle.isPartitionDateValueDaysSinceEpoch()})
+                        type, /*dateValueDaysSinceEpoch=*/false})
                 .second) {
           columnTypes_.emplace(name, type);
         }
@@ -518,7 +486,7 @@ CudfHiveDataSource::CudfHiveDataSource(
     readColumnNames_.emplace_back(name);
   }
 
-  optimizeQueryCtx_ = makeRemainingFilterQueryCtx(*connectorQueryCtx);
+  optimizeQueryCtx_ = makeRemainingFilterQueryCtx(queryConfig);
   auto filters = splitAndFoldFilters(
       *tableHandle_, expressionEvaluator_, optimizeQueryCtx_.get(), pool_);
   const auto reason =
@@ -622,7 +590,6 @@ CudfHiveDataSource::CudfHiveDataSource(
 
   // Create empty IOStats and FsStats for later use
   ioStatistics_ = std::make_shared<io::IoStatistics>();
-  ioStats_ = std::make_shared<bytedance::bolt::IoStats>();
 }
 
 std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
@@ -636,7 +603,6 @@ std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
       connectorQueryCtx_,
       cudfHiveConfig_,
       ioStatistics_,
-      ioStats_,
       subfieldFilterAst_);
 }
 
@@ -677,8 +643,9 @@ void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
   for (const auto& [name, value] : hiveSplit->partitionKeys) {
     cudfHiveSplitBuilder.partitionKey(name, value);
   }
-  if (hiveSplit->properties.has_value()) {
-    cudfHiveSplitBuilder.fileProperties(hiveSplit->properties.value());
+  if (hiveSplit->fileSize > 0) {
+    cudfHiveSplitBuilder.fileProperties(FileProperties{
+        .fileSize = static_cast<int64_t>(hiveSplit->fileSize)});
   }
   split_ = cudfHiveSplitBuilder.build();
 
@@ -760,13 +727,11 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   // The split does not carry the size, so open the file for it. On S3 the
   // open costs a HEAD request.
   try {
-    const auto fileHandleKey = FileHandleKey{
-        .filename = split_->filePath,
-        .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
-    auto fileProperties = FileProperties{};
-    auto const fileHandleCachePtr = fileHandleFactory_->generate(
-        fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
-    if (fileHandleCachePtr.get() and fileHandleCachePtr.get()->file) {
+    auto const fileHandleCachePtr =
+        fileHandleFactory_
+            ->generate(split_->filePath, filesystems::FileOptions{})
+            .second;
+    if (fileHandleCachePtr and fileHandleCachePtr->file) {
       completedBytes_ += fileHandleCachePtr->file->size();
     }
   } catch (const std::exception& e) {
@@ -823,8 +788,6 @@ void CudfHiveDataSource::setFromDataSource(std::unique_ptr<DataSource> source) {
   // 'source', so carry the balance accumulated here over to those.
   preparedSource->ioStatistics_->merge(*ioStatistics_);
   ioStatistics_ = std::move(preparedSource->ioStatistics_);
-  preparedSource->ioStats_->merge(*ioStats_);
-  ioStats_ = std::move(preparedSource->ioStats_);
 }
 
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
@@ -960,36 +923,25 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   return output;
 }
 
-std::unordered_map<std::string, RuntimeMetric>
-CudfHiveDataSource::getRuntimeStats() {
-  auto result = runtimeStats_.toRuntimeMetricMap();
-  io::addIoStatsToRuntimeStats(*ioStatistics_, "", result);
-  if (const auto it = result.find(std::string(io::kStorageReadBytes));
-      it != result.end()) {
-    // Preserve the DWIO value before a ReadFile-layer value overrides it.
-    // Overread bytes are defined relative to this counter.
-    result.emplace(kDwioStorageReadBytes, it->second);
-  }
-  // Preserve a zero-valued totalScanTime before scan timing is recorded.
-  result.insert({
-      {std::string(io::kTotalScanTime),
-       RuntimeMetric(
-           ioStatistics_->totalScanTimeNs(), RuntimeCounter::Unit::kNanos)},
-      {std::string(Connector::kTotalRemainingFilterTime),
-       RuntimeMetric(
+std::unordered_map<std::string, RuntimeCounter>
+CudfHiveDataSource::runtimeStats() {
+  return {
+      {"skippedSplits", RuntimeCounter(runtimeStats_.skippedSplits)},
+      {"processedSplits", RuntimeCounter(runtimeStats_.processedSplits)},
+      {"skippedSplitBytes",
+       RuntimeCounter(
+           runtimeStats_.skippedSplitBytes, RuntimeCounter::Unit::kBytes)},
+      {"storageReadBytes",
+       RuntimeCounter(
+           ioStatistics_->rawBytesRead(), RuntimeCounter::Unit::kBytes)},
+      {"totalScanTime",
+       RuntimeCounter(
+           ioStatistics_->totalScanTime(), RuntimeCounter::Unit::kNanos)},
+      {"totalRemainingFilterTime",
+       RuntimeCounter(
            totalRemainingFilterTime_.load(std::memory_order_relaxed),
            RuntimeCounter::Unit::kNanos)},
-  });
-  const auto& ioStats = ioStats_->stats();
-  for (const auto& [key, value] : ioStats) {
-    // Keep the ReadFile-layer value under the established key.
-    if (key == io::kStorageReadBytes) {
-      result[std::string(key)] = value;
-    } else {
-      result.emplace(key, value);
-    }
-  }
-  return result;
+  };
 }
 
 const TypePtr& CudfHiveDataSource::columnType(const std::string& name) const {
@@ -1011,9 +963,7 @@ std::optional<std::string> CudfHiveDataSource::partitionKeyValue(
 }
 
 bool CudfHiveDataSource::readTimestampPartitionValueAsLocalTime() const {
-  const HiveConfig hiveConfig(cudfHiveConfig_->config());
-  return hiveConfig.readTimestampPartitionValueAsLocalTime(
-      connectorQueryCtx_->sessionProperties());
+  return false;
 }
 
 bool CudfHiveDataSource::partitionKeyFiltersAcceptSplit() const {
@@ -1053,17 +1003,9 @@ CudfHiveDataSource::makePartitionKeyScalars(cuda::stream_ref stream) const {
   scalars.reserve(partitionKeyNames_.size());
   for (const auto& name : partitionKeyNames_) {
     const auto& partitionKey = partitionKeys_.at(name);
-    const auto constant = ::bytedance::bolt::connector::newConstantFromString(
-        partitionKey.type,
-        partitionKeyValue(name),
-        pool_,
-        timestampValueAsLocalTime,
-        partitionKey.dateValueDaysSinceEpoch);
-    scalars.push_back(makeScalarFromConstantExpr(
-        std::make_shared<core::ConstantTypedExpr>(constant),
-        pool_,
-        partitionKey.type->isTimestamp() ? timestampType : std::nullopt,
-        stream));
+    BOLT_NYI(
+        "Partition key {} is not supported by the cuDF Hive data source",
+        name);
   }
   return scalars;
 }

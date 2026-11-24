@@ -42,7 +42,7 @@
 namespace bytedance::bolt::cudf_velox {
 
 std::optional<cudf::data_type> tryVeloxToCudfDataType(const TypePtr& type) {
-  if (type->providesCustomComparison()) {
+  if (false) {
     return std::nullopt;
   }
   switch (type->kind()) {
@@ -61,9 +61,6 @@ std::optional<cudf::data_type> tryVeloxToCudfDataType(const TypePtr& type) {
       }
       return cudf::data_type{cudf::type_id::INT32};
     case TypeKind::BIGINT:
-      if (type->isTime()) {
-        return std::nullopt;
-      }
       if (type->isDecimal()) {
         auto const decimalType =
             std::dynamic_pointer_cast<const ShortDecimalType>(type);
@@ -125,7 +122,7 @@ cudf::data_type veloxToCudfDataType(const TypePtr& type) {
   if (!result) {
     CUDF_FAIL(
         "Unsupported Velox type: " +
-        std::string(TypeKindName::toName(type->kind())));
+        std::string(mapTypeKindToName(type->kind())));
   }
   return *result;
 }
@@ -166,9 +163,7 @@ std::unique_ptr<cudf::table> toCudfTable(
       .flattenDictionary = true,
       .flattenConstant = true,
       .timestampUnit = unit,
-      .timestampTimeZone = timestampTimeZone,
-      .exportVarbinaryAsString = true,
-      .useDecimalTypeWidth = true};
+      .timestampTimeZone = timestampTimeZone};
   ArrowArray arrowArray;
   exportToArrow(
       std::dynamic_pointer_cast<bytedance::bolt::BaseVector>(veloxTable),
@@ -288,7 +283,7 @@ RowVectorPtr toVeloxColumn(
     setArrowFormatBackToVarbinary(&schemaCopy, *outputType);
   }
 
-  auto veloxTable = importFromArrowAsOwner(schemaCopy, arrayCopy, pool);
+  auto veloxTable = importFromArrowAsOwner(schemaCopy, arrayCopy, ArrowOptions{}, pool);
 
   // BaseVector to RowVector
   auto castedPtr =

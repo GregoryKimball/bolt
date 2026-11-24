@@ -462,7 +462,8 @@ std::unique_ptr<cudf::column> makeRepeatedArrayColumn(
       BaseVector::create(arrayVector->type(), 1, arrayVector->pool());
   SelectivityVector singleRow(1);
   std::vector<vector_size_t> sourceRows(1, 0);
-  literalArray->copy(arrayVector.get(), singleRow, sourceRows.data());
+  literalArray->copy(
+      arrayVector.get(), singleRow, sourceRows.data(), false);
 
   auto rowVector = std::make_shared<RowVector>(
       arrayVector->pool(),

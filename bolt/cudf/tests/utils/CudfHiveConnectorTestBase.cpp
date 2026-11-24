@@ -23,7 +23,7 @@
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/file/FileSystems.h"
 #include "bolt/common/file/tests/FaultyFileSystem.h"
-#include "bolt/connectors/ConnectorRegistry.h"
+#include "bolt/cudf/compat/ConnectorRegistry.h"
 #include "bolt/connectors/hive/HiveConnector.h"
 #include "bolt/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h"
 #include "bolt/dwio/common/FileSink.h"

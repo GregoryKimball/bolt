@@ -39,15 +39,18 @@ class CudfHiveConnector final
 
   std::unique_ptr<DataSource> createDataSource(
       const RowTypePtr& outputType,
-      const ConnectorTableHandlePtr& tableHandle,
-      const ColumnHandleMap& columnHandles,
-      ConnectorQueryCtx* connectorQueryCtx) override final;
+      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+      const std::unordered_map<
+          std::string,
+          std::shared_ptr<::bytedance::bolt::connector::ColumnHandle>>& columnHandles,
+      std::shared_ptr<ConnectorQueryCtx> connectorQueryCtx,
+      const core::QueryConfig& queryConfig) override final;
 
   bool canAddDynamicFilter() const override {
     return false;
   }
 
-  bool supportsSplitPreload() const override {
+  bool supportsSplitPreload() override {
     return true;
   }
 
@@ -71,8 +74,12 @@ class CudfHiveConnectorFactory
   std::shared_ptr<Connector> newConnector(
       const std::string& id,
       std::shared_ptr<const ConfigBase> config,
-      folly::Executor* ioExecutor = nullptr,
-      folly::Executor* cpuExecutor = nullptr) override;
+      folly::Executor* executor = nullptr) override;
+
+  std::shared_ptr<Connector> newConnector(
+      const std::string& id,
+      std::shared_ptr<const Config> config,
+      folly::Executor* executor = nullptr) override;
 };
 
 } // namespace bytedance::bolt::cudf_velox::connector::hive

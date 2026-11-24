@@ -39,8 +39,7 @@ CudfOrderBy::CudfOrderBy(
           nvtx3::rgb{64, 224, 208}, // Turquoise
           NvtxMethodFlag::kAll,
           std::nullopt,
-          orderByNode),
-      planNodeBoundary_{core::PlanNode::Boundary::kBoth} {
+          orderByNode) {
   initializeSortKeys(orderByNode->sortingKeys(), orderByNode->sortingOrders());
 }
 
@@ -57,8 +56,7 @@ CudfOrderBy::CudfOrderBy(
           nvtx3::rgb{64, 224, 208}, // Turquoise
           NvtxMethodFlag::kAll,
           std::nullopt,
-          mergeExchangeNode),
-      planNodeBoundary_{core::PlanNode::Boundary::kOutput} {
+          mergeExchangeNode) {
   initializeSortKeys(
       mergeExchangeNode->sortingKeys(), mergeExchangeNode->sortingOrders());
 }

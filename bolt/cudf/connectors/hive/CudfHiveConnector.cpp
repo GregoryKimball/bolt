@@ -37,34 +37,33 @@ CudfHiveConnector::CudfHiveConnector(
 
 std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
     const RowTypePtr& outputType,
-    const ConnectorTableHandlePtr& tableHandle,
-    const ColumnHandleMap& columnHandles,
-    ConnectorQueryCtx* connectorQueryCtx) {
+    const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+    const std::unordered_map<
+        std::string,
+        std::shared_ptr<::bytedance::bolt::connector::ColumnHandle>>& columnHandles,
+    std::shared_ptr<ConnectorQueryCtx> connectorQueryCtx,
+    const core::QueryConfig& queryConfig) {
   // If it's parquet then return CudfHiveDataSource
   // If it's not parquet then return HiveDataSource
   // TODO (dm): Make this ^^^ happen
   // Problem: this information is in split, not table handle
 
   if (cudfIsRegistered() && isTypeSupportedByCudf(outputType) &&
-      CudfHiveDataSource::isSupported(tableHandle, *connectorQueryCtx)) {
+      CudfHiveDataSource::isSupported(
+          tableHandle, *connectorQueryCtx, queryConfig)) {
     return std::make_unique<CudfHiveDataSource>(
         outputType,
         tableHandle,
         columnHandles,
         &fileHandleFactory_,
-        ioExecutor_,
+        executor_,
         connectorQueryCtx,
+        queryConfig,
         cudfHiveConfig_);
   }
 
-  return std::make_unique<::bytedance::bolt::connector::hive::HiveDataSource>(
-      outputType,
-      tableHandle,
-      columnHandles,
-      &fileHandleFactory_,
-      ioExecutor_,
-      connectorQueryCtx,
-      hiveConfig_);
+  return HiveConnector::createDataSource(
+      outputType, tableHandle, columnHandles, connectorQueryCtx, queryConfig);
 }
 
 // TODO (dm): Re-add data sink
@@ -72,9 +71,21 @@ std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
 std::shared_ptr<Connector> CudfHiveConnectorFactory::newConnector(
     const std::string& id,
     std::shared_ptr<const bytedance::bolt::config::ConfigBase> config,
-    folly::Executor* ioExecutor,
-    folly::Executor* cpuExecutor) {
-  return std::make_shared<CudfHiveConnector>(id, config, ioExecutor);
+    folly::Executor* executor) {
+  registerObjectFactory(id);
+  return std::make_shared<CudfHiveConnector>(id, config, executor);
+}
+
+std::shared_ptr<Connector> CudfHiveConnectorFactory::newConnector(
+    const std::string& id,
+    std::shared_ptr<const Config> config,
+    folly::Executor* executor) {
+  return newConnector(
+      id,
+      config == nullptr
+          ? nullptr
+          : std::make_shared<config::ConfigBase>(config->valuesCopy()),
+      executor);
 }
 
 } // namespace bytedance::bolt::cudf_velox::connector::hive

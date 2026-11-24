@@ -86,8 +86,9 @@ class CudfVector : public RowVector {
 
   uint64_t estimateFlatSize() const override;
 
+  uint64_t retainedSize() const override;
+
  private:
-  uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override;
 
   // Storage for either an owned table or packed table.
   // Only one is active at a time - using variant enforces this at compile time.

@@ -61,9 +61,21 @@ SOURCE_SUFFIXES = {".h", ".cpp", ".cu", ".cuh", ".hpp", ".inl"}
 
 # Bolt keeps its own CMake files and these hand-written sources.
 KEEP = ["CMakeLists.txt", "CudfEnable.h"]
+# Bolt's stand-ins for Velox headers it does not have.
+KEEP_DIRS = ["compat"]
 
 REWRITES = [
     (re.compile(r'#include "velox/experimental/cudf/'), '#include "bolt/cudf/'),
+    (
+        re.compile(
+            r'#include "velox/(?:type|connectors)/(TypeUtil|ConnectorRegistry)\.h"'
+        ),
+        r'#include "bolt/cudf/compat/\1.h"',
+    ),
+    (
+        re.compile(r'#include "velox/common/caching/FileProperties\.h"'),
+        '#include "bolt/connectors/hive/FileProperties.h"',
+    ),
     (re.compile(r"#include <experimental/cudf/([^>]+)>"), r'#include "bolt/cudf/\1"'),
     (re.compile(r'#include "velox/'), '#include "bolt/'),
     (re.compile(r"\bfacebook::velox\b"), "bytedance::bolt"),
@@ -115,6 +127,9 @@ def main() -> int:
         src = tmp_path / SOURCE
 
         for path in sorted(DEST.rglob("*")):
+            rel = path.relative_to(DEST).parts
+            if rel[0] in KEEP_DIRS:
+                continue
             if path.is_file() and path.name not in KEEP:
                 path.unlink()
         for path in sorted(DEST.rglob("*"), reverse=True):

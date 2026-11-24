@@ -167,16 +167,8 @@ void CudfLocalPartition::recordOutputStats(RowVectorPtr& input) {
 }
 
 void CudfLocalPartition::flushVectorPool() {
-  // We reuse the LocalExchangeQueue from the CPU implementation. That impl
-  // stores used vectors in a vector pool for the CPU LocalPartition to re-use.
-  // CudfLocalPartition does not need it and does not extract it. This results
-  // in unnecessary extension of the lifetimes of vectors that were exchanged,
-  // resulting in kind of a memory leak.
-  // This is a hack to forcefully flush the vector pools.
-
-  for (auto& queue : queues_) {
-    queue->getVector();
-  }
+  // Bolt's LocalExchangeQueue keeps no vector pool, so there is nothing to
+  // flush.
 }
 
 void CudfLocalPartition::enqueuePartition(
@@ -188,8 +180,7 @@ void CudfLocalPartition::enqueuePartition(
   }
 
   ContinueFuture future;
-  auto blockingReason = queues_[partitionIndex]->enqueue(
-      cudfVector, retainedBytes(*cudfVector), &future);
+  auto blockingReason = queues_[partitionIndex]->enqueue(cudfVector, &future);
   if (blockingReason != exec::BlockingReason::kNotBlocked) {
     blockingReasons_.push_back(blockingReason);
     futures_.push_back(std::move(future));
@@ -274,7 +265,7 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
     // Single partition case.
     ContinueFuture future;
     auto blockingReason =
-        queues_[0]->enqueue(input, retainedBytes(*cudfVector), &future);
+        queues_[0]->enqueue(input, &future);
     if (blockingReason != exec::BlockingReason::kNotBlocked) {
       blockingReasons_.push_back(blockingReason);
       futures_.push_back(std::move(future));

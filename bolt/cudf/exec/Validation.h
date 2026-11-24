@@ -18,7 +18,7 @@
 
 #include "bolt/cudf/CudfConfig.h"
 
-#include "bolt/common/base/ExceptionHelper.h"
+#include "bolt/common/base/Exceptions.h"
 
 namespace bytedance::bolt::cudf_velox {
 

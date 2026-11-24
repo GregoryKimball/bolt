@@ -103,10 +103,11 @@ cudf::ast::literal makeLiteralFromScalar(
 template <TypeKind kind>
 variant getVariant(const VectorPtr& vector, size_t atIndex = 0) {
   using T = typename bytedance::bolt::KindToFlatVector<kind>::WrapperType;
-  if constexpr (!std::is_same_v<T, ComplexType>) {
+  if constexpr (
+      !std::is_same_v<T, ComplexType> && std::is_constructible_v<variant, T>) {
     return vector->as<SimpleVector<T>>()->valueAt(atIndex);
   } else {
-    return Variant();
+    return variant();
   }
 }
 

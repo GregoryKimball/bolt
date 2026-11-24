@@ -27,7 +27,7 @@
 #include "bolt/core/PlanNode.h"
 #include "bolt/exec/Task.h" // NOLINT(misc-unused-headers)
 #include "bolt/expression/ExprOptimizer.h"
-#include "bolt/type/TypeUtil.h"
+#include "bolt/cudf/compat/TypeUtil.h"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>

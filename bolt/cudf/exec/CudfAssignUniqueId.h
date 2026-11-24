@@ -48,11 +48,6 @@ class CudfAssignUniqueId : public CudfOperatorBase {
     return exec::BlockingReason::kNotBlocked;
   }
 
-  bool startDrain() override {
-    // No need to drain for assignUniqueId operator.
-    return false;
-  }
-
   bool isFinished() override;
 
  protected:

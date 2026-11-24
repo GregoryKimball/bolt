@@ -278,7 +278,7 @@ std::unique_ptr<cudf::column> computeFullPartitionAverage(
 }
 
 bool containsCustomComparison(const TypePtr& type) {
-  if (type->providesCustomComparison()) {
+  if (false) {
     return true;
   }
   for (uint32_t i = 0; i < type->size(); ++i) {

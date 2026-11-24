@@ -103,7 +103,7 @@ void registerSparkFunctions(const std::string& prefix) {
            .returnType("integer")
            .constantArgumentType("integer")
            .argumentType("any")
-           .variableArity("any")
+           .argumentType("any").variableArity()
            .build()},
       true,
       [](const core::TypedExprPtr& expr, const core::QueryConfig&) {

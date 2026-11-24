@@ -31,7 +31,6 @@
 #include "bolt/exec/HashAggregationStatNames.h"
 #include "bolt/exec/Task.h"
 #include "bolt/expression/Expr.h"
-#include "bolt/functions/prestosql/PrestoQueryConfig.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -1445,8 +1444,7 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
         aggregate.constant,
         aggregate.resultType,
         aggregate.maskIndex,
-        functions::prestosql::PrestoQueryConfig{queryConfig}
-            .arrayAggIgnoreNulls());
+        queryConfig.get<bool>("presto.array_agg.ignore_nulls", false));
   } else if (kind.rfind(prefix + "stddev_samp", 0) == 0) {
     return std::make_unique<GroupbyStddevSampAggregator>(
         aggregate.companionStep,
@@ -1709,7 +1707,7 @@ CudfGroupby::CudfGroupby(
           aggregationNode->id(),
           std::string{"CudfGroupby"} +
               std::string{
-                  core::AggregationNode::toName(aggregationNode->step())},
+                  core::AggregationNode::stepName(aggregationNode->step())},
           nvtx3::rgb{34, 139, 34}, // Forest Green
           NvtxMethodFlag::kAddInput | NvtxMethodFlag::kGetOutput,
           std::nullopt,

@@ -925,7 +925,7 @@ CudfReduce::CudfReduce(
           aggregationNode->id(),
           std::string{"CudfReduce"} +
               std::string{
-                  core::AggregationNode::toName(aggregationNode->step())},
+                  core::AggregationNode::stepName(aggregationNode->step())},
           nvtx3::rgb{34, 139, 34}, // Forest Green
           NvtxMethodFlag::kAddInput | NvtxMethodFlag::kGetOutput,
           std::nullopt,

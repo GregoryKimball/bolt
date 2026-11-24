@@ -162,8 +162,7 @@ uint64_t CudfVector::estimateFlatSize() const {
   return flatSize_;
 }
 
-uint64_t CudfVector::retainedSizeImpl(
-    uint64_t& /*totalStringBufferSize*/) const {
+uint64_t CudfVector::retainedSize() const {
   return flatSize_;
 }
 

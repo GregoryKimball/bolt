@@ -31,9 +31,6 @@ class CudfTpchBenchmark : public TpchBenchmark {
  public:
   void initialize() override;
 
-  std::shared_ptr<bytedance::bolt::config::ConfigBase> makeConnectorProperties()
-      override;
-
   std::vector<std::shared_ptr<bytedance::bolt::connector::ConnectorSplit>>
   listSplits(
       const std::string& path,

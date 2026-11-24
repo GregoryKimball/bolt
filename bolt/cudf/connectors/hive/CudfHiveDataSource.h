@@ -63,22 +63,25 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   /// NOTE: Partition key filters are checked too, although the Hive data source
   /// tests them per split instead of compiling them.
   static bool isSupported(
-      const ConnectorTableHandlePtr& tableHandle,
-      const ConnectorQueryCtx& connectorQueryCtx);
+      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+      const ConnectorQueryCtx& connectorQueryCtx,
+      const core::QueryConfig& queryConfig);
 
   /// Returns why isSupported() rejects 'tableHandle', or std::nullopt if it
   /// accepts it.
   static std::optional<std::string> unsupportedReason(
-      const ConnectorTableHandlePtr& tableHandle,
-      const ConnectorQueryCtx& connectorQueryCtx);
+      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+      const ConnectorQueryCtx& connectorQueryCtx,
+      const core::QueryConfig& queryConfig);
 
   CudfHiveDataSource(
       const RowTypePtr& outputType,
-      const ConnectorTableHandlePtr& tableHandle,
-      const ColumnHandleMap& columnHandles,
+      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+      const std::unordered_map<std::string, std::shared_ptr<::bytedance::bolt::connector::ColumnHandle>>& columnHandles,
       bytedance::bolt::FileHandleFactory* fileHandleFactory,
       folly::Executor* executor,
-      const ConnectorQueryCtx* connectorQueryCtx,
+      const std::shared_ptr<ConnectorQueryCtx>& connectorQueryCtx,
+      const core::QueryConfig& queryConfig,
       const std::shared_ptr<CudfHiveConfig>& CudfHiveConfig);
 
   void addSplit(std::shared_ptr<ConnectorSplit> split) override;
@@ -101,15 +104,11 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
     return completedRows_;
   }
 
-  const common::SubfieldFilters* getFilters() const override {
-    return &subfieldFilters_;
-  }
-
   uint64_t getCompletedBytes() override {
     return completedBytes_;
   }
 
-  std::unordered_map<std::string, RuntimeMetric> getRuntimeStats() override;
+  std::unordered_map<std::string, RuntimeCounter> runtimeStats() override;
 
  protected:
   // Indicates the component that turns the partition keys of a split into
@@ -129,11 +128,12 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // component resolves partition keys.
   CudfHiveDataSource(
       const RowTypePtr& outputType,
-      const ConnectorTableHandlePtr& tableHandle,
-      const ColumnHandleMap& columnHandles,
+      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
+      const std::unordered_map<std::string, std::shared_ptr<::bytedance::bolt::connector::ColumnHandle>>& columnHandles,
       bytedance::bolt::FileHandleFactory* fileHandleFactory,
       folly::Executor* executor,
-      const ConnectorQueryCtx* connectorQueryCtx,
+      const std::shared_ptr<ConnectorQueryCtx>& connectorQueryCtx,
+      const core::QueryConfig& queryConfig,
       const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
       PartitionKeySource partitionKeySource);
 
@@ -152,6 +152,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   const std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
   bytedance::bolt::FileHandleFactory* const fileHandleFactory_;
   folly::Executor* const executor_;
+  const std::shared_ptr<ConnectorQueryCtx> connectorQueryCtxHolder_;
   const ConnectorQueryCtx* const connectorQueryCtx_;
 
   // Carries the session settings the remaining filter is folded and compiled
@@ -163,7 +164,6 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   std::vector<std::string> readColumnNames_;
 
   std::shared_ptr<io::IoStatistics> ioStatistics_;
-  std::shared_ptr<bolt::IoStats> ioStats_;
 
   // The row type for the data source output, not including filter-only columns.
   const RowTypePtr outputType_;

@@ -19,7 +19,6 @@
 
 #include "bolt/common/memory/Memory.h"
 #include "bolt/core/Expressions.h"
-#include "bolt/type/Time.h"
 #include "bolt/vector/ConstantVector.h"
 
 #include <cudf/binaryop.hpp>

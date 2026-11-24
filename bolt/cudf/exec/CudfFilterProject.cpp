@@ -49,7 +49,7 @@ void debugPrintTree(
     std::ostream& os = std::cout) {
   if (indent == 0)
     os << "=== Expression Tree ===" << std::endl;
-  os << std::string(indent, ' ') << core::ExprKindName::toName(expr->kind())
+  os << std::string(indent, ' ') << typeid(*expr).name()
      << "(" << expr->type()->toString() << ")" << std::endl;
   for (auto& input : expr->inputs()) {
     debugPrintTree(input, indent + 2, os);
@@ -194,8 +194,7 @@ void CudfFilterProject::initialize() {
   }
 
   auto lazyDereference =
-      (dynamic_cast<const core::LazyDereferenceNode*>(project_.get()) !=
-       nullptr);
+false;
   BOLT_CHECK(!(lazyDereference && filter_));
 
   const auto inputType = project_ ? project_->sources()[0]->outputType()

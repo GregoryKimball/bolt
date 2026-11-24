@@ -17,7 +17,6 @@
 #include "bolt/cudf/CudfConfig.h"
 #include "bolt/cudf/connectors/hive/CudfHiveConnector.h"
 #include "bolt/cudf/connectors/hive/CudfHiveDataSource.h"
-#include "bolt/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #include "bolt/cudf/exec/CudfAggregation.h"
 #include "bolt/cudf/exec/CudfAssignUniqueId.h"
 #include "bolt/cudf/exec/CudfBatchConcat.h"
@@ -48,7 +47,7 @@
 #endif
 
 #include "bolt/common/memory/Memory.h"
-#include "bolt/connectors/ConnectorRegistry.h"
+#include "bolt/cudf/compat/ConnectorRegistry.h"
 #include "bolt/connectors/hive/TableHandle.h"
 #include "bolt/exec/AssignUniqueId.h"
 #include "bolt/exec/CallbackSink.h"
@@ -79,7 +78,7 @@ namespace bytedance::bolt::cudf_velox {
 namespace {
 
 bool containsCustomComparison(const TypePtr& type) {
-  if (type->providesCustomComparison()) {
+  if (false) {
     return true;
   }
   for (size_t i = 0; i < type->size(); ++i) {
@@ -207,13 +206,9 @@ class TableScanAdapter : public OperatorAdapter {
     auto cudfHiveConnector = std::dynamic_pointer_cast<
         bytedance::bolt::cudf_velox::connector::hive::CudfHiveConnector>(
         connector);
-    auto cudfIcebergConnector =
-        std::dynamic_pointer_cast<bytedance::bolt::cudf_velox::connector::hive::
-                                      iceberg::CudfIcebergConnector>(connector);
-
-    if (cudfHiveConnector == nullptr && cudfIcebergConnector == nullptr) {
+    if (cudfHiveConnector == nullptr) {
       LOG_FALLBACK(
-          "TableScan connector is not CudfHiveConnector or CudfIcebergConnector, PlanNode id: {}",
+          "TableScan connector is not CudfHiveConnector, PlanNode id: {}",
           planNode->id());
       return false;
     }
@@ -228,7 +223,9 @@ class TableScanAdapter : public OperatorAdapter {
         /*connectorPool=*/nullptr);
     if (const auto reason = bytedance::bolt::cudf_velox::connector::hive::
             CudfHiveDataSource::unsupportedReason(
-                tableScanNode->tableHandle(), *connectorQueryCtx)) {
+                tableScanNode->tableHandle(),
+                *connectorQueryCtx,
+                ctx->queryConfig())) {
       LOG_FALLBACK(
           "TableScan is not supported by the cuDF data source, PlanNode id: {}: {}",
           planNode->id(),
@@ -1056,9 +1053,8 @@ class AssignUniqueIdAdapter : public OperatorAdapter {
             operatorId,
             ctx,
             assignUniqueIdPlanNode,
-            ctx->task->planFragment().taskUniqueId.value_or(
-                assignUniqueIdPlanNode->taskUniqueId()),
-            ctx->task->uniqueRowIdPool()));
+            assignUniqueIdPlanNode->taskUniqueId(),
+            assignUniqueIdPlanNode->uniqueIdCounter()));
     return result;
   }
 };

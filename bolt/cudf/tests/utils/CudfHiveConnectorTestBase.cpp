@@ -1,0 +1,334 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "bolt/cudf/CudfConfig.h"
+#include "bolt/cudf/connectors/hive/CudfHiveConnector.h"
+#include "bolt/cudf/exec/ToCudf.h"
+#include "bolt/cudf/exec/VeloxCudfInterop.h"
+#include "bolt/cudf/tests/utils/CudfHiveConnectorTestBase.h"
+
+#include "bolt/common/base/Exceptions.h"
+#include "bolt/common/file/FileSystems.h"
+#include "bolt/common/file/tests/FaultyFileSystem.h"
+#include "bolt/connectors/ConnectorRegistry.h"
+#include "bolt/connectors/hive/HiveConnector.h"
+#include "bolt/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h"
+#include "bolt/dwio/common/FileSink.h"
+#include "bolt/dwio/common/tests/utils/BatchMaker.h"
+#include "bolt/exec/Driver.h"
+#include "bolt/exec/tests/utils/AssertQueryBuilder.h"
+
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/types.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+
+#include <functional>
+#include <string>
+
+namespace bytedance::bolt::cudf_velox::exec::test {
+using namespace bytedance::bolt::common::testutil;
+
+namespace {
+
+void fillColumnNames(
+    cudf::io::table_input_metadata& tableMeta,
+    const RowTypePtr& rowType) {
+  BOLT_CHECK_EQ(tableMeta.column_metadata.size(), rowType->size());
+  for (int32_t i = 0; i < tableMeta.column_metadata.size(); ++i) {
+    tableMeta.column_metadata[i].set_name(rowType->nameOf(i));
+  }
+}
+
+} // namespace
+
+using bytedance::bolt::connector::hive::HiveConnectorFactory;
+
+CudfHiveConnectorTestBase::CudfHiveConnectorTestBase() {
+  filesystems::registerLocalFileSystem();
+  filesystems::registerS3FileSystem();
+  tests::utils::registerFaultyFileSystem();
+}
+
+void CudfHiveConnectorTestBase::SetUp() {
+  OperatorTestBase::SetUp();
+
+  // Register cudf to enable the CudfDatasource creation from CudfHiveConnector
+  bytedance::bolt::cudf_velox::CudfConfig::getInstance().allowCpuFallback =
+      false;
+  bytedance::bolt::cudf_velox::registerCudf();
+
+  // Register Hive connector
+  bytedance::bolt::cudf_velox::connector::hive::CudfHiveConnectorFactory
+      factory;
+  auto config = std::unordered_map<std::string, std::string>{};
+  auto hiveConnector = factory.newConnector(
+      kCudfHiveConnectorId,
+      std::make_shared<bytedance::bolt::config::ConfigBase>(std::move(config)),
+      ioExecutor_.get());
+  bytedance::bolt::connector::ConnectorRegistry::global().insert(
+      hiveConnector->connectorId(), hiveConnector);
+  dwio::common::registerFileSinks();
+}
+
+void CudfHiveConnectorTestBase::TearDown() {
+  // Make sure all pending loads are finished or cancelled before unregister
+  // connector.
+  ioExecutor_.reset();
+  bytedance::bolt::connector::ConnectorRegistry::global().erase(
+      kCudfHiveConnectorId);
+  bytedance::bolt::cudf_velox::unregisterCudf();
+  OperatorTestBase::TearDown();
+}
+
+void CudfHiveConnectorTestBase::resetCudfHiveConnector(
+    const std::shared_ptr<const bytedance::bolt::config::ConfigBase>& config) {
+  bytedance::bolt::connector::ConnectorRegistry::global().erase(
+      kCudfHiveConnectorId);
+
+  bytedance::bolt::cudf_velox::connector::hive::CudfHiveConnectorFactory
+      factory;
+  auto hiveConnector =
+      factory.newConnector(kCudfHiveConnectorId, config, ioExecutor_.get());
+  bytedance::bolt::connector::ConnectorRegistry::global().insert(
+      hiveConnector->connectorId(), hiveConnector);
+}
+
+std::vector<RowVectorPtr> CudfHiveConnectorTestBase::makeVectors(
+    const RowTypePtr& rowType,
+    int32_t numVectors,
+    int32_t rowsPerVector) {
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t i = 0; i < numVectors; ++i) {
+    auto vector = std::dynamic_pointer_cast<RowVector>(
+        bolt::test::BatchMaker::createBatch(rowType, rowsPerVector, *pool_));
+    vectors.push_back(vector);
+  }
+  return vectors;
+}
+
+std::shared_ptr<bytedance::bolt::exec::Task>
+CudfHiveConnectorTestBase::assertQuery(
+    const core::PlanNodePtr& plan,
+    const std::vector<std::shared_ptr<TempFilePath>>& filePaths,
+    const std::string& duckDbSql) {
+  return OperatorTestBase::assertQuery(
+      plan, makeCudfHiveConnectorSplits(filePaths), duckDbSql);
+}
+
+std::shared_ptr<bytedance::bolt::exec::Task>
+CudfHiveConnectorTestBase::assertQuery(
+    const bytedance::bolt::core::PlanNodePtr& plan,
+    const std::vector<
+        std::shared_ptr<bytedance::bolt::connector::ConnectorSplit>>& splits,
+    const std::string& duckDbSql,
+    const int32_t numPrefetchSplit) {
+  return bytedance::bolt::exec::test::AssertQueryBuilder(
+             plan, duckDbQueryRunner_)
+      .config(
+          bytedance::bolt::core::QueryConfig::kMaxSplitPreloadPerDriver,
+          std::to_string(numPrefetchSplit))
+      .splits(splits)
+      .assertResults(duckDbSql);
+}
+
+std::vector<std::shared_ptr<TempFilePath>>
+CudfHiveConnectorTestBase::makeFilePaths(int count) {
+  std::vector<std::shared_ptr<TempFilePath>> filePaths;
+  filePaths.reserve(count);
+  for (auto i = 0; i < count; ++i) {
+    filePaths.emplace_back(TempFilePath::create());
+  }
+  return filePaths;
+}
+
+void CudfHiveConnectorTestBase::writeToFile(
+    const std::string& filePath,
+    const std::vector<RowVectorPtr>& vectors) {
+  // Convert all RowVectorPtrs to cudf tables
+  auto stream = cudf::get_default_stream();
+  std::vector<std::unique_ptr<cudf::table>> cudfTables;
+  cudfTables.reserve(vectors.size());
+  for (const auto& vector : vectors) {
+    BOLT_CHECK_NOT_NULL(vector);
+    if (vector->size()) {
+      auto cudfTable = with_arrow::toCudfTable(
+          vector,
+          vector->pool(),
+          stream,
+          cudf::get_current_device_resource_ref());
+      stream.sync();
+      cudfTables.emplace_back(std::move(cudfTable));
+    }
+  }
+  // Make sure cudfTables has at least one table
+  if (cudfTables.empty()) {
+    return;
+  }
+
+  // Create a sink and writer
+  auto rowType = asRowType(vectors[0]->type());
+  auto const sinkInfo = cudf::io::sink_info(filePath);
+  auto tableInputMetadata =
+      cudf::io::table_input_metadata(cudfTables[0]->view());
+  fillColumnNames(tableInputMetadata, rowType);
+  auto options = cudf::io::chunked_parquet_writer_options::builder(sinkInfo)
+                     .metadata(tableInputMetadata)
+                     .build();
+  cudf::io::chunked_parquet_writer writer(options, stream);
+
+  // Write all table chunks
+  for (const auto& table : cudfTables) {
+    writer.write(table->view());
+  }
+
+  // Close the writer
+  writer.close();
+}
+
+void CudfHiveConnectorTestBase::writeToFile(
+    const std::string& filePath,
+    RowVectorPtr vector) {
+  BOLT_CHECK_NOT_NULL(vector);
+  auto rowType = asRowType(vector->type());
+  auto const sinkInfo = cudf::io::sink_info(filePath);
+  auto stream = cudf::get_default_stream();
+  auto cudfTable = with_arrow::toCudfTable(
+      vector, vector->pool(), stream, cudf::get_current_device_resource_ref());
+  stream.sync();
+  auto tableInputMetadata = cudf::io::table_input_metadata(cudfTable->view());
+  fillColumnNames(tableInputMetadata, rowType);
+  auto options =
+      cudf::io::parquet_writer_options::builder(sinkInfo, cudfTable->view())
+          .metadata(tableInputMetadata)
+          .build();
+  cudf::io::write_parquet(options, stream);
+}
+
+std::vector<std::shared_ptr<bytedance::bolt::connector::ConnectorSplit>>
+CudfHiveConnectorTestBase::makeCudfHiveConnectorSplits(
+    const std::vector<std::shared_ptr<TempFilePath>>& filePaths) {
+  std::vector<std::shared_ptr<bytedance::bolt::connector::ConnectorSplit>>
+      splits;
+  for (const auto& filePath : filePaths) {
+    splits.push_back(makeCudfHiveConnectorSplit(
+        filePath->getPath(),
+        filePath->fileSize(),
+        filePath->fileModifiedTime(),
+        0,
+        std::numeric_limits<uint64_t>::max()));
+  }
+  return splits;
+}
+
+std::vector<
+    std::shared_ptr<bytedance::bolt::connector::hive::HiveConnectorSplit>>
+CudfHiveConnectorTestBase::makeCudfHiveConnectorSplits(
+    const std::string& filePath,
+    uint32_t splitCount,
+    const std::optional<std::unordered_map<std::string, std::string>>&
+        infoColumns) {
+  auto file =
+      filesystems::getFileSystem(filePath, nullptr)->openFileForRead(filePath);
+  const int64_t fileSize = file->size();
+  // Take the upper bound.
+  const int64_t splitSize = std::ceil((fileSize) / splitCount);
+  std::vector<
+      std::shared_ptr<bytedance::bolt::connector::hive::HiveConnectorSplit>>
+      splits;
+  // Add all the splits.
+  for (int i = 0; i < splitCount; i++) {
+    auto splitBuilder =
+        bytedance::bolt::connector::hive::HiveConnectorSplitBuilder(filePath)
+            .connectorId(kCudfHiveConnectorId)
+            .fileFormat(bytedance::bolt::dwio::common::FileFormat::PARQUET)
+            .start(i * splitSize)
+            .length(splitSize);
+    if (infoColumns.has_value()) {
+      for (auto infoColumn : infoColumns.value()) {
+        splitBuilder.infoColumn(infoColumn.first, infoColumn.second);
+      }
+    }
+    splits.push_back(splitBuilder.build());
+  }
+  return splits;
+}
+
+std::shared_ptr<bytedance::bolt::connector::hive::HiveConnectorSplit>
+CudfHiveConnectorTestBase::makeCudfHiveConnectorSplit(
+    const std::string& filePath,
+    uint64_t start,
+    uint64_t length,
+    int64_t splitWeight) {
+  return bytedance::bolt::connector::hive::HiveConnectorSplitBuilder(filePath)
+      .connectorId(kCudfHiveConnectorId)
+      .fileFormat(bytedance::bolt::dwio::common::FileFormat::PARQUET)
+      .start(start)
+      .length(length)
+      .splitWeight(splitWeight)
+      .build();
+}
+
+std::shared_ptr<bytedance::bolt::connector::hive::HiveConnectorSplit>
+CudfHiveConnectorTestBase::makeCudfHiveConnectorSplit(
+    const std::string& filePath,
+    int64_t fileSize,
+    int64_t fileModifiedTime,
+    uint64_t start,
+    uint64_t length) {
+  return bytedance::bolt::connector::hive::HiveConnectorSplitBuilder(filePath)
+      .connectorId(kCudfHiveConnectorId)
+      .fileFormat(bytedance::bolt::dwio::common::FileFormat::PARQUET)
+      .infoColumn("$file_size", fmt::format("{}", fileSize))
+      .infoColumn("$file_modified_time", fmt::format("{}", fileModifiedTime))
+      .fileProperties(
+          FileProperties{
+              .fileSize = fileSize,
+              .modificationTime = fileModifiedTime,
+          })
+      .start(start)
+      .length(length)
+      .build();
+}
+// static
+std::shared_ptr<connector::hive::CudfHiveInsertTableHandle>
+CudfHiveConnectorTestBase::makeCudfHiveInsertTableHandle(
+    const std::vector<std::string>& tableColumnNames,
+    const std::vector<TypePtr>& tableColumnTypes,
+    std::shared_ptr<connector::hive::LocationHandle> locationHandle,
+    const std::optional<common::CompressionKind> compressionKind,
+    const std::unordered_map<std::string, std::string>& serdeParameters,
+    const std::shared_ptr<dwio::common::WriterOptions>& writerOptions) {
+  std::vector<std::shared_ptr<const connector::hive::CudfHiveColumnHandle>>
+      columnHandles;
+
+  for (int i = 0; i < tableColumnNames.size(); ++i) {
+    columnHandles.push_back(
+        std::make_shared<connector::hive::CudfHiveColumnHandle>(
+            tableColumnNames.at(i),
+            tableColumnTypes.at(i),
+            veloxToCudfDataType(tableColumnTypes.at(i))));
+  }
+
+  return std::make_shared<connector::hive::CudfHiveInsertTableHandle>(
+      columnHandles,
+      locationHandle,
+      compressionKind,
+      serdeParameters,
+      writerOptions);
+}
+
+} // namespace bytedance::bolt::cudf_velox::exec::test

@@ -1,0 +1,84 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "bolt/cudf/exec/CudfOperator.h"
+#include "bolt/cudf/vector/CudfVector.h"
+
+#include "bolt/exec/Operator.h"
+#include "bolt/vector/ComplexVector.h"
+
+#include <cudf/types.hpp>
+
+namespace bytedance::bolt::cudf_velox {
+
+class CudfOrderBy : public CudfOperatorBase {
+ public:
+  CudfOrderBy(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      const std::shared_ptr<const core::OrderByNode>& orderByNode);
+
+  /// Builds the GPU sort appended after a kept UcxExchange operator. Together,
+  /// the two operators implement MergeExchange on the GPU.
+  CudfOrderBy(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      const std::shared_ptr<const core::MergeExchangeNode>& mergeExchangeNode);
+
+  bool needsInput() const override {
+    return !finished_;
+  }
+
+  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
+    return exec::BlockingReason::kNotBlocked;
+  }
+
+  bool isFinished() override {
+    return finished_;
+  }
+
+  /// Returns kOutput when built for a MergeExchangeNode, whose input the
+  /// exchange operator sharing that node reports, and kBoth for an OrderByNode.
+  core::PlanNode::Boundary planNodeBoundary() const override {
+    return planNodeBoundary_;
+  }
+
+ protected:
+  void doAddInput(RowVectorPtr input) override;
+  RowVectorPtr doGetOutput() override;
+  void doNoMoreInput() override;
+  void doClose() override;
+
+ private:
+  // Initializes cuDF sort keys from the plan node's ordering.
+  void initializeSortKeys(
+      const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
+      const std::vector<core::SortOrder>& sortingOrders);
+
+  CudfVectorPtr outputTable_;
+  std::vector<CudfVectorPtr> inputs_;
+  std::vector<cudf::size_type> sortKeys_;
+  std::vector<cudf::order> columnOrder_;
+  std::vector<cudf::null_order> nullOrder_;
+  bool finished_{false};
+
+  // See planNodeBoundary().
+  const core::PlanNode::Boundary planNodeBoundary_;
+};
+
+} // namespace bytedance::bolt::cudf_velox

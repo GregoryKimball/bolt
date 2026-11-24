@@ -1,0 +1,73 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "bolt/common/memory/Memory.h"
+#include "bolt/vector/ComplexVector.h"
+
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+
+#include <cuda/stream>
+
+namespace bytedance::bolt::cudf_velox {
+
+/// Returns the cuDF data type for \p type, or std::nullopt if the type
+/// (or any child type for ARRAY/ROW) cannot be represented in cuDF.
+std::optional<cudf::data_type> tryVeloxToCudfDataType(const TypePtr& type);
+
+/// Returns the cuDF data type for \p type.  Throws on unsupported types.
+cudf::data_type veloxToCudfDataType(const TypePtr& type);
+
+/// Returns true if every leaf type in \p type can be represented in cuDF.
+bool isTypeSupportedByCudf(const TypePtr& type);
+
+namespace with_arrow {
+
+std::unique_ptr<cudf::table> toCudfTable(
+    const bytedance::bolt::RowVectorPtr& veloxTable,
+    bytedance::bolt::memory::MemoryPool* pool,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    std::optional<std::string> timestampTimeZone = std::nullopt);
+
+bytedance::bolt::RowVectorPtr toVeloxColumn(
+    const cudf::table_view& table,
+    bytedance::bolt::memory::MemoryPool* pool,
+    std::string namePrefix,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+// Accepts a Velox TypePtr for recursive metadata construction.
+bytedance::bolt::RowVectorPtr toVeloxColumn(
+    const cudf::table_view& table,
+    bytedance::bolt::memory::MemoryPool* pool,
+    const bytedance::bolt::RowTypePtr& outputType,
+    std::string namePrefix,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+bytedance::bolt::RowVectorPtr toVeloxColumn(
+    const cudf::table_view& table,
+    bytedance::bolt::memory::MemoryPool* pool,
+    const TypePtr& type,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+} // namespace with_arrow
+
+} // namespace bytedance::bolt::cudf_velox

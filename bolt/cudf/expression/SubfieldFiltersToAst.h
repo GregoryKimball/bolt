@@ -1,0 +1,77 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#pragma once
+
+#include "bolt/type/Filter.h"
+#include "bolt/type/Subfield.h"
+#include "bolt/type/Type.h"
+
+#include <cudf/ast/expressions.hpp>
+#include <cudf/scalar/scalar.hpp>
+
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace cudf {
+namespace ast {
+class tree;
+}
+} // namespace cudf
+
+namespace bytedance::bolt::cudf_velox {
+
+struct SubfieldFilterDecimalType {
+  cudf::type_id type;
+  int32_t scale;
+};
+
+// Physical cuDF storage type and scale for each top-level decimal input field.
+using SubfieldFilterDecimalTypes =
+    std::unordered_map<std::string, SubfieldFilterDecimalType>;
+
+bool hasDecimalSubfieldFilter(
+    const common::SubfieldFilters& subfieldFilters,
+    const RowTypePtr& inputRowSchema);
+
+/// Returns whether createAstFromSubfieldFilter() converts 'filter' on
+/// 'subfield'. It converts filters on top-level columns only. A scan with a
+/// filter it cannot convert must run on the CPU.
+bool canCreateAstFromSubfieldFilter(
+    const common::Subfield& subfield,
+    const common::Filter& filter);
+
+// Convert subfield filters to cudf AST
+cudf::ast::expression const& createAstFromSubfieldFilter(
+    const common::Subfield& subfield,
+    const common::Filter& filter,
+    cudf::ast::tree& tree,
+    std::vector<std::unique_ptr<cudf::scalar>>& scalars,
+    const RowTypePtr& inputRowSchema,
+    const SubfieldFilterDecimalTypes* decimalTypes = nullptr);
+
+// Build a single AST expression representing logical AND of all filters in
+// 'subfieldFilters'. The resulting expression reference is owned by the passed
+// 'tree'.
+cudf::ast::expression const& createAstFromSubfieldFilters(
+    const common::SubfieldFilters& subfieldFilters,
+    cudf::ast::tree& tree,
+    std::vector<std::unique_ptr<cudf::scalar>>& scalars,
+    const RowTypePtr& inputRowSchema,
+    const SubfieldFilterDecimalTypes* decimalTypes = nullptr);
+
+} // namespace bytedance::bolt::cudf_velox

@@ -1,0 +1,274 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "bolt/cudf/expression/ExpressionEvaluatorRegistry.h"
+
+#include "bolt/core/Expressions.h"
+#include "bolt/expression/FunctionSignature.h"
+#include "bolt/type/Type.h"
+
+#include <cudf/column/column.hpp>
+#include <cudf/table/table_view.hpp>
+
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <variant>
+#include <vector>
+
+namespace bytedance::bolt::core {
+class QueryCtx;
+} // namespace bytedance::bolt::core
+
+namespace bytedance::bolt::cudf_velox {
+
+// Holds either a non-owning cudf::column_view (zero-copy) or an owning
+// cudf::column (materialised result).
+using ColumnOrView =
+    std::variant<cudf::column_view, std::unique_ptr<cudf::column>>;
+
+// Helper to always obtain a column_view.
+inline cudf::column_view asView(ColumnOrView& holder) {
+  return std::visit(
+      [](auto& h) -> cudf::column_view {
+        using T = std::decay_t<decltype(h)>;
+        if constexpr (std::is_same_v<T, cudf::column_view>) {
+          return h;
+        } else {
+          return h->view();
+        }
+      },
+      holder);
+}
+
+// Helper to convert a table_view to a vector of column_views.
+inline std::vector<cudf::column_view> tableViewToColumnViews(
+    cudf::table_view tableView) {
+  std::vector<cudf::column_view> result;
+  result.reserve(tableView.num_columns());
+  for (cudf::size_type i = 0; i < tableView.num_columns(); ++i) {
+    result.push_back(tableView.column(i));
+  }
+  return result;
+}
+
+// Throws a BoltUserError with userMessage if any non-null entry of cond is
+// false. cond must be a BOOL8 column. Does nothing for empty or all-null
+// columns.
+void checkAllTrue(
+    cudf::column_view cond,
+    std::string_view userMessage,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+class CudfFunction {
+ public:
+  virtual ~CudfFunction() = default;
+  virtual ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const = 0;
+};
+
+/// Builds a function using the session config. The config is valid only for
+/// this call; copy any settings needed after construction (or copy QueryConfig,
+/// which holds a single shared_ptr).
+using CudfFunctionFactory = std::function<std::shared_ptr<CudfFunction>(
+    const std::string& name,
+    const core::TypedExprPtr& expr,
+    memory::MemoryPool* pool,
+    const core::QueryConfig& config)>;
+
+/// Optional function-specific eligibility check applied after signature
+/// matching. Use this for semantic restrictions, including unsupported session
+/// settings, that cannot be expressed by a FunctionSignature. Both
+/// FunctionExpression::canEvaluate and createCudfFunction apply this filter
+/// with the session config. The config is valid only for the call.
+using CudfCanEvaluate = std::function<
+    bool(const core::TypedExprPtr& expr, const core::QueryConfig& config)>;
+
+/// A function implementation and the signatures and settings it supports.
+struct CudfFunctionSpec {
+  CudfFunctionFactory factory;
+  std::vector<exec::FunctionSignaturePtr> signatures;
+  // If set, this must return true before the factory is selected.
+  CudfCanEvaluate canEvaluate;
+};
+
+/// Registers a function implementation with an optional eligibility predicate.
+/// If overwrite is false, returns false when the name is already registered.
+/// Otherwise appends the implementation; the first matching registration wins.
+bool registerCudfFunction(
+    const std::string& name,
+    CudfFunctionFactory factory,
+    const std::vector<exec::FunctionSignaturePtr>& signatures,
+    bool overwrite = true,
+    CudfCanEvaluate canEvaluate = nullptr);
+
+/// Registers the same function implementation under each alias.
+void registerCudfFunctions(
+    const std::vector<std::string>& aliases,
+    CudfFunctionFactory factory,
+    const std::vector<exec::FunctionSignaturePtr>& signatures,
+    bool overwrite = true,
+    CudfCanEvaluate canEvaluate = nullptr);
+
+/// Creates a function for the expression and session config. Returns nullptr
+/// if no registered function matches the signature and eligibility predicate.
+/// The config is valid only for this call; see CudfFunctionFactory.
+std::shared_ptr<CudfFunction> createCudfFunction(
+    const std::string& name,
+    const core::TypedExprPtr& expr,
+    memory::MemoryPool* pool,
+    const core::QueryConfig& config);
+
+bool registerBuiltinFunctions(const std::string& prefix);
+
+void unregisterFunctions();
+
+/// Turns the GPU casts that follow Presto's rules on or off: the cast from
+/// VARCHAR, whose strings CastFunction parses as Presto does, and the cast
+/// from TIMESTAMP to VARCHAR, which it prints as Presto does.
+/// registerPrestoFunctions() turns them on and registerSparkFunctions() off;
+/// unregisterFunctions() turns them off as well.
+void setPrestoCastEnabled(bool enabled);
+
+class CudfExpression {
+ public:
+  virtual ~CudfExpression() = default;
+  virtual void close() = 0;
+
+  virtual ColumnOrView eval(
+      std::vector<cudf::column_view> inputColumnViews,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr,
+      bool finalize = false) = 0;
+};
+
+using CudfExpressionPtr = std::shared_ptr<CudfExpression>;
+
+class FunctionExpression : public CudfExpression {
+ public:
+  /// Builds the function and its child evaluators with the session config.
+  static std::shared_ptr<FunctionExpression> create(
+      const core::TypedExprPtr& expr,
+      const RowTypePtr& inputRowSchema,
+      memory::MemoryPool* pool,
+      const core::QueryConfig& config);
+
+  ColumnOrView eval(
+      std::vector<cudf::column_view> inputColumnViews,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr,
+      bool finalize = false) override;
+
+  void close() override;
+
+  /// Checks if this operation supports the expression and session config.
+  /// Does not recursively check children or retain the config.
+  static bool canEvaluate(
+      const core::TypedExprPtr& expr,
+      const core::QueryConfig& config);
+
+ private:
+  static std::unique_ptr<cudf::column> makeStructChildColumn(
+      ColumnOrView& structColumn,
+      cudf::size_type childIndex,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr);
+
+  core::TypedExprPtr expr_;
+  std::shared_ptr<CudfFunction> function_;
+  std::vector<std::shared_ptr<CudfExpression>> subexpressions_;
+  // Index of the dereferenced field inside its parent ROW for nested
+  // FieldAccess/Dereference expressions. -1 for non-nested or non-field
+  // expressions.
+  int32_t fieldIndex_{-1};
+
+  RowTypePtr inputRowSchema_;
+};
+
+/// Create a CudfExpression from a TypedExpr, selecting the best evaluator.
+/// Does not apply expression-level optimization; callers that need
+/// optimization should run expression::optimize at the top-level entry point
+/// first.
+///
+/// `config` is the session query config, used for evaluator eligibility and
+/// function construction. It is valid only for this call; evaluators and
+/// functions must copy settings they need afterwards (or copy QueryConfig).
+std::shared_ptr<CudfExpression> createCudfExpression(
+    const core::TypedExprPtr& expr,
+    const RowTypePtr& inputRowSchema,
+    memory::MemoryPool* pool,
+    const core::QueryConfig& config);
+
+/// Plan-time GPU eligibility for a top-level operator expression, as invoked by
+/// the OperatorAdapters and the aggregation validators. Optimizes the
+/// expression (constant folding and rewrites) with `pool` so the check sees the
+/// same form the operator compiles at runtime; e.g. cast(<literal> as DECIMAL)
+/// folds to a plain decimal constant that the structural check accepts, rather
+/// than a live decimal-target cast that it would reject. Then applies the
+/// query-context-dependent fallbacks (a timezone-sensitive date_trunc, and
+/// with a session time zone a cast from TIMESTAMP to VARCHAR, under
+/// adjust_timestamp_to_session_timezone; a cast from VARCHAR, or from
+/// TIMESTAMP to VARCHAR, under legacy_cast; and a cast from VARCHAR to REAL or
+/// DOUBLE under cast_string_to_floating_point_lenient_inf_nan, must stay on
+/// CPU) and evaluator eligibility, including per-function session checks, on
+/// the optimized expression. With a null queryCtx, eligibility uses default
+/// settings. When `queryCtx` or `pool` is null, skips optimization and checks
+/// `expr` directly.
+/// \param pool Leaf pool used for constant folding during optimization,
+///             typically the operator's own pool.
+bool canExprRunOnGpu(
+    const core::TypedExprPtr& expr,
+    core::QueryCtx* queryCtx,
+    memory::MemoryPool* pool);
+
+/// Plan-time GPU eligibility for a join filter: canExprRunOnGpu(), and no CAST
+/// from VARCHAR. The GPU precomputes such a cast over every row of a side,
+/// where the CPU casts only the pairs the join matches, so a string that spells
+/// no value in a row the join never matches would fail only on the GPU. A
+/// TRY_CAST gives NULL instead and is fine.
+bool canJoinFilterRunOnGpu(
+    const core::TypedExprPtr& filter,
+    core::QueryCtx* queryCtx,
+    memory::MemoryPool* pool);
+
+/// Returns true if 'expr' holds a CAST or TRY_CAST from VARCHAR; with
+/// 'floatingPointOnly', one to REAL or DOUBLE.
+bool containsCastFromVarchar(
+    const core::TypedExprPtr& expr,
+    bool floatingPointOnly);
+
+/// Returns true if 'expr' holds a CAST or TRY_CAST from TIMESTAMP to VARCHAR.
+bool containsTimestampToVarcharCast(const core::TypedExprPtr& expr);
+
+/// Extract the full field path from a field access / dereference chain.
+/// Returns nullopt for non-field expressions.
+std::optional<std::vector<std::string>> extractFieldPath(
+    const core::TypedExprPtr& expr);
+
+/// Return the set of top-level input field names referenced by the expression.
+std::unordered_set<std::string> referencedInputFields(
+    const core::TypedExprPtr& expr);
+
+} // namespace bytedance::bolt::cudf_velox

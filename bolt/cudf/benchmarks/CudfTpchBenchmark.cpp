@@ -1,0 +1,199 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "bolt/cudf/CudfConfig.h"
+#include "bolt/cudf/benchmarks/CudfTpchBenchmark.h"
+#include "bolt/cudf/connectors/hive/CudfHiveConfig.h"
+#include "bolt/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "bolt/cudf/exec/CudfConversion.h"
+#include "bolt/cudf/exec/ToCudf.h"
+#include "bolt/cudf/expression/PrestoFunctions.h"
+#include "bolt/cudf/tests/utils/CudfHiveConnectorTestBase.h"
+
+#include "bolt/connectors/ConnectorRegistry.h"
+#include "bolt/connectors/hive/HiveConnector.h"
+#include "bolt/exec/tests/utils/HiveConnectorTestBase.h"
+
+#include "bolt/cudf/connectors/hive/CudfHiveConnector.h"
+
+DECLARE_int64(max_coalesced_bytes);
+DECLARE_string(max_coalesced_distance_bytes);
+DECLARE_int32(parquet_prefetch_rowgroups);
+
+using namespace bytedance::bolt;
+using namespace bytedance::bolt::common::testutil;
+using namespace bytedance::bolt::exec;
+using namespace bytedance::bolt::exec::test;
+using namespace bytedance::bolt::dwio::common;
+
+DEFINE_uint64(
+    cudf_chunk_read_limit,
+    0,
+    "Output table chunk read limit for cudf::parquet_chunked_reader.");
+
+DEFINE_uint64(
+    cudf_pass_read_limit,
+    0,
+    "Pass read limit for cudf::parquet_chunked_reader.");
+
+DEFINE_int32(
+    cudf_gpu_batch_size_rows,
+    100000,
+    "Preferred output batch size in rows for cudf operators.");
+
+DEFINE_uint64(
+    cudf_local_exchange_buffer_size,
+    1UL << 30,
+    "Maximum buffered bytes per local exchange before applying backpressure.");
+
+DEFINE_bool(velox_cudf_table_scan, true, "Enable cuDF table scan");
+DEFINE_bool(
+    cudf_hive_use_buffered_input,
+    true,
+    "Use BufferedInputDataSource instead of KvikIO for cuDF Hive reads");
+
+DEFINE_bool(
+    cudf_hive_preload_column_chunks,
+    false,
+    "Load column chunks while preloading cuDF Hive splits");
+
+DEFINE_bool(
+    cudf_hive_serialize_io_requests,
+    false,
+    "Serialize I/O submissions to prevent interleaving between concurrent splits");
+
+DEFINE_string(
+    cudf_properties,
+    "",
+    "Path to a properties file for CudfConfig. Each line should be key=value "
+    "(e.g. cudf.memory_resource=async). See CudfConfig for available keys.");
+
+void CudfTpchBenchmark::initialize() {
+  if (!FLAGS_cudf_properties.empty()) {
+    cudf_velox::CudfConfig::getInstance().initialize(
+        cudf_velox::loadPropertiesFile(FLAGS_cudf_properties));
+  }
+
+  TpchBenchmark::initialize();
+
+  if (FLAGS_velox_cudf_table_scan) {
+    connector::ConnectorRegistry::global().erase(
+        bytedance::bolt::exec::test::kHiveConnectorId);
+
+    auto cudfHiveConfigurationValues =
+        std::unordered_map<std::string, std::string>();
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kMaxChunkReadLimit] =
+            std::to_string(FLAGS_cudf_chunk_read_limit);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kMaxPassReadLimit] =
+            std::to_string(FLAGS_cudf_pass_read_limit);
+    cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
+                                    kAllowMismatchedCudfHiveSchemas] =
+        std::to_string(true);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInput] =
+            std::to_string(FLAGS_cudf_hive_use_buffered_input);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kPreloadColumnChunks] =
+            std::to_string(FLAGS_cudf_hive_preload_column_chunks);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kSerializeIoRequests] =
+            std::to_string(FLAGS_cudf_hive_serialize_io_requests);
+    auto cudfHiveProperties = std::make_shared<const config::ConfigBase>(
+        std::move(cudfHiveConfigurationValues));
+
+    cudf_velox::connector::hive::CudfHiveConnectorFactory cudfHiveFactory;
+    auto cudfHiveConnector = cudfHiveFactory.newConnector(
+        bytedance::bolt::exec::test::kHiveConnectorId,
+        cudfHiveProperties,
+        ioExecutor_.get());
+    connector::ConnectorRegistry::global().insert(
+        cudfHiveConnector->connectorId(), cudfHiveConnector);
+  }
+
+  cudf_velox::registerCudf();
+  cudf_velox::registerPrestoFunctions(
+      cudf_velox::CudfConfig::getInstance().functionNamePrefix);
+
+  queryConfigs_[bytedance::bolt::cudf_velox::CudfFromVelox::kGpuBatchSizeRows] =
+      std::to_string(FLAGS_cudf_gpu_batch_size_rows);
+  queryConfigs_[core::QueryConfig::kMaxLocalExchangeBufferSize] =
+      std::to_string(FLAGS_cudf_local_exchange_buffer_size);
+}
+
+std::shared_ptr<config::ConfigBase>
+CudfTpchBenchmark::makeConnectorProperties() {
+  auto cfg = TpchBenchmark::makeConnectorProperties();
+  using CudfHiveCfg = cudf_velox::connector::hive::CudfHiveConfig;
+
+  // CuDF-specific properties.
+  cfg->set(
+      CudfHiveCfg::kMaxChunkReadLimit,
+      std::to_string(FLAGS_cudf_chunk_read_limit));
+  cfg->set(
+      CudfHiveCfg::kMaxPassReadLimit,
+      std::to_string(FLAGS_cudf_pass_read_limit));
+  cfg->set(
+      CudfHiveCfg::kUseBufferedInput,
+      std::to_string(FLAGS_cudf_hive_use_buffered_input));
+  cfg->set(
+      CudfHiveCfg::kPreloadColumnChunks,
+      std::to_string(FLAGS_cudf_hive_preload_column_chunks));
+  cfg->set(
+      CudfHiveCfg::kSerializeIoRequests,
+      std::to_string(FLAGS_cudf_hive_serialize_io_requests));
+  cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
+
+  return cfg;
+}
+
+std::vector<std::shared_ptr<connector::ConnectorSplit>>
+CudfTpchBenchmark::listSplits(
+    const std::string& path,
+    int32_t numSplitsPerFile,
+    const exec::test::TpchPlan& plan) {
+  // TODO (dm): Figure out a way to enforce 1 split per file in
+  // CudfHiveDataSource outside of this benchmark
+  if (FLAGS_velox_cudf_table_scan) {
+    // TODO (dm): Instead of this, we can maybe use
+    // makeHiveConnectorSplits(vector<shared_ptr<TempFilePath>>&
+    // filePaths)
+    std::vector<std::shared_ptr<connector::ConnectorSplit>> result;
+    auto temp = HiveConnectorTestBase::makeHiveConnectorSplits(
+        path, 1, plan.dataFileFormat);
+    for (auto& i : temp) {
+      result.push_back(i);
+    }
+    return result;
+  }
+
+  return TpchBenchmark::listSplits(path, numSplitsPerFile, plan);
+}
+
+void CudfTpchBenchmark::shutdown() {
+  cudf_velox::unregisterCudf();
+  TpchBenchmark::shutdown();
+}
+
+int main(int argc, char** argv) {
+  std::string kUsage(
+      "This program benchmarks TPC-H queries. Run 'velox_cudf_tpch_benchmark -helpon=TpchBenchmark' for available options.\n");
+  gflags::SetUsageMessage(kUsage);
+  folly::Init init{&argc, &argv, false};
+  benchmark = std::make_unique<CudfTpchBenchmark>();
+  tpchBenchmarkMain();
+}

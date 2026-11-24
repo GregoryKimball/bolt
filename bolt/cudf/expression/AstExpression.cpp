@@ -1,0 +1,165 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "bolt/cudf/CudfConfig.h"
+#include "bolt/cudf/exec/VeloxCudfInterop.h"
+#include "bolt/cudf/expression/AstExpression.h"
+#include "bolt/cudf/expression/AstExpressionUtils.h"
+#include "bolt/cudf/expression/AstPrinter.h"
+#include "bolt/cudf/expression/AstUtils.h"
+#include "bolt/cudf/expression/ExpressionEvaluatorRegistry.h"
+#include "bolt/cudf/vector/TableViewPrinter.h"
+
+#include "bolt/vector/ComplexVector.h"
+#include "bolt/vector/ConstantVector.h"
+
+namespace bytedance::bolt::cudf_velox {
+
+cudf::ast::expression const& createAstTree(
+    const core::TypedExprPtr& expr,
+    cudf::ast::tree& tree,
+    std::vector<std::unique_ptr<cudf::scalar>>& scalars,
+    const RowTypePtr& inputRowSchema,
+    std::vector<PrecomputeInstruction>& precomputeInstructions,
+    memory::MemoryPool* pool,
+    const core::QueryConfig& config) {
+  AstContext context{
+      tree,
+      scalars,
+      {inputRowSchema},
+      {precomputeInstructions},
+      pool,
+      expr,
+      config};
+  return context.pushExprToTree(expr);
+}
+
+cudf::ast::expression const& createAstTree(
+    const core::TypedExprPtr& expr,
+    cudf::ast::tree& tree,
+    std::vector<std::unique_ptr<cudf::scalar>>& scalars,
+    const RowTypePtr& leftRowSchema,
+    const RowTypePtr& rightRowSchema,
+    std::vector<PrecomputeInstruction>& leftPrecomputeInstructions,
+    std::vector<PrecomputeInstruction>& rightPrecomputeInstructions,
+    memory::MemoryPool* pool,
+    const core::QueryConfig& config) {
+  AstContext context{
+      tree,
+      scalars,
+      {leftRowSchema, rightRowSchema},
+      {leftPrecomputeInstructions, rightPrecomputeInstructions},
+      pool,
+      expr,
+      config};
+  return context.pushExprToTree(expr);
+}
+
+ASTExpression::ASTExpression(
+    const core::TypedExprPtr& expr,
+    const RowTypePtr& inputRowSchema,
+    memory::MemoryPool* pool,
+    const core::QueryConfig& config)
+    : expr_(expr), inputRowSchema_(inputRowSchema), pool_(pool) {
+  createAstTree(
+      expr,
+      cudfTree_,
+      scalars_,
+      inputRowSchema,
+      precomputeInstructions_,
+      pool_,
+      config);
+}
+
+void ASTExpression::close() {
+  cudfTree_ = {};
+  scalars_.clear();
+  precomputeInstructions_.clear();
+}
+
+ColumnOrView ASTExpression::eval(
+    std::vector<cudf::column_view> inputColumnViews,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    bool finalize) {
+  auto precomputedColumns = precomputeSubexpressions(
+      inputColumnViews,
+      precomputeInstructions_,
+      scalars_,
+      inputRowSchema_,
+      stream);
+
+  // Make table_view from input columns and precomputed columns
+  std::vector<cudf::column_view> allColumnViews(inputColumnViews);
+  allColumnViews.reserve(inputColumnViews.size() + precomputedColumns.size());
+  for (auto& precomputedCol : precomputedColumns) {
+    allColumnViews.push_back(asView(precomputedCol));
+  }
+
+  cudf::table_view astInputTableView(allColumnViews);
+
+  auto result = [&]() -> ColumnOrView {
+    if (auto colRefPtr = dynamic_cast<cudf::ast::column_reference const*>(
+            &cudfTree_.back())) {
+      auto columnIndex = colRefPtr->get_column_index();
+      if (columnIndex < inputColumnViews.size()) {
+        return inputColumnViews[columnIndex];
+      } else {
+        // Referencing a precomputed column return as it is (view or owned)
+        return std::move(
+            precomputedColumns[columnIndex - inputColumnViews.size()]);
+      }
+    } else {
+      if (CudfConfig::getInstance().debugEnabled) {
+        LOG(INFO) << cudf::ast::expression_to_string(cudfTree_.back());
+        LOG(INFO) << cudf::table_schema_to_string(astInputTableView);
+      }
+      return cudf::compute_column(
+          astInputTableView, cudfTree_.back(), stream, mr);
+    }
+  }();
+  if (finalize) {
+    const auto requestedType = cudf_velox::veloxToCudfDataType(expr_->type());
+    auto resultView = asView(result);
+    if (resultView.type() != requestedType) {
+      result = cudf::cast(resultView, requestedType, stream, mr);
+    }
+  }
+  return result;
+}
+
+bool ASTExpression::canEvaluate(const core::TypedExprPtr& expr) {
+  // Keep this in sync with pushExprToTree(); otherwise unsupported field types
+  // can recursively select AST/JIT while trying to precompute themselves.
+  return detail::isAstExprSupported(expr);
+}
+
+void registerAstEvaluator(int priority) {
+  registerCudfExpressionEvaluator(
+      kAstEvaluatorName,
+      priority,
+      [](const core::TypedExprPtr& expr, const core::QueryConfig&) {
+        return ASTExpression::canEvaluate(expr);
+      },
+      [](const core::TypedExprPtr& expr,
+         const RowTypePtr& row,
+         memory::MemoryPool* pool,
+         const core::QueryConfig& config) {
+        return std::make_shared<ASTExpression>(expr, row, pool, config);
+      },
+      /*overwrite=*/false);
+}
+
+} // namespace bytedance::bolt::cudf_velox

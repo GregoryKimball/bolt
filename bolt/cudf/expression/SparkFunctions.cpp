@@ -1,0 +1,158 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "bolt/cudf/expression/CommonFunctions.h"
+#include "bolt/cudf/expression/DateTruncFunction.h"
+#include "bolt/cudf/expression/ExpressionEvaluator.h"
+#include "bolt/cudf/expression/SparkFunctions.h"
+#include "bolt/cudf/expression/sparksql/DateAddFunction.h"
+#include "bolt/cudf/expression/sparksql/HashFunction.h"
+#include "bolt/cudf/expression/sparksql/SubStringFunction.h"
+
+#include "bolt/expression/FunctionSignature.h"
+
+namespace bytedance::bolt::cudf_velox {
+namespace {
+
+void registerSparkArrayAccessFunctions(const std::string& prefix) {
+  // Spark get is 0 based and returns NULL for negative or out-of-bounds
+  // indices.
+  registerArrayAccessFunction(
+      prefix + "get",
+      ArrayAccessPolicy{
+          .allowNegativeIndices = true,
+          .nullOnNegativeIndices = true,
+          .allowOutOfBound = true,
+          .indexStartsAtOne = false,
+      },
+      arrayAccessSignatures({"tinyint", "smallint", "integer", "bigint"}));
+}
+
+} // namespace
+
+void registerSparkFunctions(const std::string& prefix) {
+  using exec::FunctionSignatureBuilder;
+
+  registerCudfFunction(
+      prefix + "isnull",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool*,
+         const core::QueryConfig&) {
+        return std::make_shared<IsNullFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("boolean")
+           .argumentType("T")
+           .build()});
+
+  // CastFunction's cast from VARCHAR and cast from TIMESTAMP to VARCHAR follow
+  // Presto's rules, not Spark's.
+  setPrestoCastEnabled(false);
+
+  const std::vector<exec::FunctionSignaturePtr> subStringSignatures{
+      FunctionSignatureBuilder()
+          .returnType("varchar")
+          .argumentType("varchar")
+          .argumentType("integer")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("varchar")
+          .argumentType("varchar")
+          .argumentType("integer")
+          .argumentType("integer")
+          .build()};
+  for (const auto& name : {prefix + "substr", prefix + "substring"}) {
+    // Route both spellings to the Spark implementation in cuDF. Presto
+    // substring is registered only when Presto functions are registered, so
+    // Spark runtimes do not need to override an existing candidate.
+    registerCudfFunction(
+        name,
+        [](const std::string&,
+           const core::TypedExprPtr& expr,
+           memory::MemoryPool* pool,
+           const core::QueryConfig&) {
+          return sparksql::makeSubStringFunction(expr, pool);
+        },
+        subStringSignatures);
+  }
+
+  registerCudfFunction(
+      prefix + "hash_with_seed",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool,
+         const core::QueryConfig&) {
+        return std::make_shared<sparksql::HashFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("integer")
+           .constantArgumentType("integer")
+           .argumentType("any")
+           .variableArity("any")
+           .build()},
+      true,
+      [](const core::TypedExprPtr& expr, const core::QueryConfig&) {
+        return sparksql::HashFunction::canEvaluate(expr);
+      });
+
+  registerCudfFunction(
+      prefix + "date_add",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool,
+         const core::QueryConfig&) {
+        return std::make_shared<sparksql::DateAddFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("integer")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "date_trunc",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool,
+         const core::QueryConfig&) {
+        return std::make_shared<DateTruncFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("timestamp")
+           .constantArgumentType("varchar")
+           .argumentType("timestamp")
+           .build()},
+      true,
+      [](const core::TypedExprPtr& expr, const core::QueryConfig&) {
+        return DateTruncFunction::canEvaluate(expr);
+      });
+
+  registerSparkArrayAccessFunctions(prefix);
+}
+
+} // namespace bytedance::bolt::cudf_velox

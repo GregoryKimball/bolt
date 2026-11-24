@@ -30,4 +30,17 @@
 
 #pragma once
 
+#include <memory>
+
+#include "bolt/benchmarks/QueryBenchmarkBase.h"
+
+class TpchBenchmark : public bytedance::bolt::QueryBenchmarkBase {
+ public:
+  void runMain(std::ostream& out, bytedance::bolt::RunStats& runStats) override;
+};
+
+/// The benchmark tpchBenchmarkMain() runs. A subclass, for example the cuDF
+/// benchmark, replaces it before calling tpchBenchmarkMain().
+extern std::unique_ptr<TpchBenchmark> benchmark;
+
 void tpchBenchmarkMain();

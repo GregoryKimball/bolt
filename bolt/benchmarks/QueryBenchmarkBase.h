@@ -96,7 +96,7 @@ class QueryBenchmarkBase {
  public:
   virtual ~QueryBenchmarkBase() = default;
   virtual void initialize();
-  void shutdown();
+  virtual void shutdown();
   std::pair<std::unique_ptr<exec::test::TaskCursor>, std::vector<RowVectorPtr>>
   run(const exec::test::TpchPlan& tpchPlan);
 
@@ -136,5 +136,8 @@ class QueryBenchmarkBase {
   std::vector<ParameterDim> parameters_;
 
   std::vector<RunStats> runStats_;
+
+  // Query configs added to every query run.
+  std::unordered_map<std::string, std::string> queryConfigs_;
 };
 } // namespace bytedance::bolt

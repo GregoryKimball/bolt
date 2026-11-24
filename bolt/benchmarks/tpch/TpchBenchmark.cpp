@@ -28,7 +28,7 @@
  * --------------------------------------------------------------------------
  */
 
-#include "bolt/benchmarks/QueryBenchmarkBase.h"
+#include "bolt/benchmarks/tpch/TpchBenchmark.h"
 #include "bolt/common/testutil/GPerf.h"
 using namespace bytedance::bolt;
 using namespace bytedance::bolt::exec;
@@ -77,9 +77,7 @@ DEFINE_bool(
 
 std::shared_ptr<TpchQueryBuilder> queryBuilder;
 
-class TpchBenchmark : public QueryBenchmarkBase {
- public:
-  void runMain(std::ostream& out, RunStats& runStats) override {
+void TpchBenchmark::runMain(std::ostream& out, RunStats& runStats) {
     if (FLAGS_bolt_benchmark_enable_cpu_profiler) {
       BoltProfilerStart("tpch.prof");
     }
@@ -133,133 +131,131 @@ class TpchBenchmark : public QueryBenchmarkBase {
     if (FLAGS_bolt_benchmark_enable_cpu_profiler) {
       BoltProfilerStop();
     }
-  }
-};
+}
 
-TpchBenchmark benchmark;
+std::unique_ptr<TpchBenchmark> benchmark = std::make_unique<TpchBenchmark>();
 
 BENCHMARK(q1) {
   const auto planContext = queryBuilder->getQueryPlan(1);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q2) {
   const auto planContext = queryBuilder->getQueryPlan(2);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q3) {
   const auto planContext = queryBuilder->getQueryPlan(3);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q4) {
   const auto planContext = queryBuilder->getQueryPlan(4);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q5) {
   const auto planContext = queryBuilder->getQueryPlan(5);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q6) {
   const auto planContext = queryBuilder->getQueryPlan(6);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q7) {
   const auto planContext = queryBuilder->getQueryPlan(7);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q8) {
   const auto planContext = queryBuilder->getQueryPlan(8);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q9) {
   const auto planContext = queryBuilder->getQueryPlan(9);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q10) {
   const auto planContext = queryBuilder->getQueryPlan(10);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q11) {
   const auto planContext = queryBuilder->getQueryPlan(11);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q12) {
   const auto planContext = queryBuilder->getQueryPlan(12);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q13) {
   const auto planContext = queryBuilder->getQueryPlan(13);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q14) {
   const auto planContext = queryBuilder->getQueryPlan(14);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q15) {
   const auto planContext = queryBuilder->getQueryPlan(15);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q16) {
   const auto planContext = queryBuilder->getQueryPlan(16);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q17) {
   const auto planContext = queryBuilder->getQueryPlan(17);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q18) {
   const auto planContext = queryBuilder->getQueryPlan(18);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q19) {
   const auto planContext = queryBuilder->getQueryPlan(19);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q20) {
   const auto planContext = queryBuilder->getQueryPlan(20);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q21) {
   const auto planContext = queryBuilder->getQueryPlan(21);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
 BENCHMARK(q22) {
   const auto planContext = queryBuilder->getQueryPlan(22);
-  benchmark.run(planContext);
+  benchmark->run(planContext);
 }
 
-int tpchBenchmarkMain() {
-  benchmark.initialize();
+void tpchBenchmarkMain() {
+  benchmark->initialize();
   queryBuilder = std::make_shared<TpchQueryBuilder>(
       toFileFormat(FLAGS_bolt_benchmark_data_format));
   queryBuilder->initialize(FLAGS_bolt_benchmark_data_path);
   if (FLAGS_bolt_benchmark_test_flags_file.empty()) {
     RunStats ignore;
-    benchmark.runMain(std::cout, ignore);
+    benchmark->runMain(std::cout, ignore);
   } else {
-    benchmark.runAllCombinations();
+    benchmark->runAllCombinations();
   }
-  benchmark.shutdown();
+  benchmark->shutdown();
   queryBuilder.reset();
-  return 0;
 }

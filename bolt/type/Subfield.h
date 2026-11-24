@@ -258,6 +258,11 @@ class Subfield {
     return std::make_unique<Subfield>(std::move(path));
   }
 
+  /// @return The name of the base column.
+  const std::string& baseName() const {
+    return static_cast<const NestedField*>(path_[0].get())->name();
+  }
+
   const std::vector<std::unique_ptr<PathElement>>& path() const {
     return path_;
   }

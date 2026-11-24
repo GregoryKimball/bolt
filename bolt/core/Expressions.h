@@ -100,6 +100,10 @@ class ConstantTypedExpr : public ITypedExpr {
     return valueVector_ != nullptr;
   }
 
+  bool isNull() const {
+    return hasValueVector() ? valueVector_->isNullAt(0) : value_.isNull();
+  }
+
   /// Returns scalar value as variant if hasValueVector() is false.
   const variant& value() const {
     return value_;

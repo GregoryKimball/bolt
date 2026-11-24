@@ -57,6 +57,8 @@ struct IdentityProjection {
   const column_index_t outputChannel;
 };
 
+class Operator;
+
 class OperatorCtx {
  public:
   OperatorCtx(
@@ -104,6 +106,16 @@ class OperatorCtx {
   }
 
   core::ExecCtx* execCtx() const;
+
+  /// Synchronizes this operator with its peers in the same pipeline. Returns
+  /// true only to the last peer, populating 'peerOperators' and the
+  /// corresponding 'promises'. Other peers receive 'future' and return false.
+  /// The last peer must fulfill every promise, including when an exception
+  /// occurs. Each peer operator retains its owning driver until released.
+  bool allPeersArrived(
+      ContinueFuture* future,
+      std::vector<ContinuePromise>& promises,
+      std::vector<std::shared_ptr<Operator>>& peerOperators) const;
 
   /// Makes an extract of QueryCtx for use in a connector. 'planNodeId'
   /// is the id of the calling TableScan. This and the task id identify the scan
@@ -209,6 +221,26 @@ class Operator : public BaseRuntimeStatWriter {
       std::optional<common::SpillConfig> spillConfig = std::nullopt);
 
   virtual ~Operator() = default;
+
+  /// Returns true if this operator is of type 'T'.
+  template <typename T>
+  bool is() const {
+    return as<T>() != nullptr;
+  }
+
+  /// Returns this operator as 'T', or nullptr if it has a different type.
+  template <typename T>
+  T* as() {
+    static_assert(std::is_base_of_v<Operator, T>);
+    return dynamic_cast<T*>(this);
+  }
+
+  /// Returns this operator as 'T', or nullptr if it has a different type.
+  template <typename T>
+  const T* as() const {
+    static_assert(std::is_base_of_v<Operator, T>);
+    return dynamic_cast<const T*>(this);
+  }
 
   /// Does initialization work for this operator which requires memory
   /// allocation from memory pool that can't be done under operator constructor.

@@ -292,7 +292,7 @@ class BoltConan(ConanFile):
             self.requires("liburing/2.6")
         if self.options.get_safe("python_bind"):
             self.requires("pybind11/2.13.1")
-        if self.options.get_safe("enable_cudf"):
+        if self.options.get_safe("enable_cudf") and not os.getenv("BOLT_CUDF_PREFIX"):
             self.requires("cudf/25.06")
         if self.options.get_safe("enable_colocate"):
             self.requires("grpc/1.50.0")
@@ -519,6 +519,11 @@ class BoltConan(ConanFile):
         tc.cache_variables["BOLT_ENABLE_CUDF"] = (
             "ON" if self.options.get_safe("enable_cudf") else "OFF"
         )
+        if self.options.get_safe("enable_cudf") and os.getenv("BOLT_CUDF_PREFIX"):
+            tc.cache_variables["BOLT_CUDF_PREFIX"] = os.getenv("BOLT_CUDF_PREFIX")
+            tc.cache_variables["CMAKE_CUDA_ARCHITECTURES"] = os.getenv(
+                "CMAKE_CUDA_ARCHITECTURES", "native"
+            )
 
         if self.options.enable_asan:
             tc.extra_cxxflags.append("-fsanitize=address")
@@ -799,7 +804,7 @@ class BoltConan(ConanFile):
                 "pybind11::pybind11_"
             )
             self.cpp_info.components["bolt_engine"].defines.append("BOLT_HAS_PYTHON=1")
-        if self.options.get_safe("enable_cudf"):
+        if self.options.get_safe("enable_cudf") and not os.getenv("BOLT_CUDF_PREFIX"):
             self.cpp_info.components["bolt_engine"].requires.append("cudf::cudf")
             self.cpp_info.components["bolt_engine"].defines.extend(
                 [

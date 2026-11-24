@@ -174,15 +174,6 @@ if(${BOLT_BUILD_PYTHON_PACKAGE})
   target_link_libraries(bolt_exec bolt_python)
 endif()
 
-if(${BOLT_ENABLE_CUDF})
-  target_compile_definitions(bolt_exec PRIVATE BOLT_HAS_CUDF=1)
-  target_include_directories(bolt_exec SYSTEM PRIVATE ${cudf_INCLUDE_DIRS})
-  target_link_libraries(
-    bolt_exec
-    bolt_cudf_exec
-    cudf::cudf
-  )
-endif()
 
 add_subdirectory(bm)
 

@@ -73,13 +73,3 @@ if(${BOLT_BUILD_PYTHON_PACKAGE})
   target_link_libraries(bolt_core PUBLIC bolt_python)
 endif()
 
-if(${BOLT_ENABLE_CUDF})
-  target_compile_definitions(bolt_core PRIVATE BOLT_HAS_CUDF=1)
-  target_include_directories(bolt_core SYSTEM PRIVATE ${cudf_INCLUDE_DIRS})
-  target_link_libraries(
-    bolt_core
-    PRIVATE
-      bolt_cudf_exec
-      cudf::cudf
-  )
-endif()

@@ -101,7 +101,7 @@ function(bolt_add_library target_name)
     "connectors/fuzzer"
     "connectors/tpch"
     "connectors/tpcds"
-    "cudf/tests"
+    "cudf/tests/utils"
     "exec/fuzzer"
     "exec/tests/utils"
     "exec/prefixsort/tests/utils"
@@ -379,7 +379,6 @@ function(bolt_configure_engine target_name)
     target_compile_definitions(
       ${target_name}
       PUBLIC
-        BOLT_HAS_CUDF=1
         LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
     )
   endif()

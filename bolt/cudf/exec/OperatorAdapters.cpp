@@ -1,0 +1,1554 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "bolt/cudf/CudfConfig.h"
+#include "bolt/cudf/connectors/hive/CudfHiveConnector.h"
+#include "bolt/cudf/connectors/hive/CudfHiveDataSource.h"
+#include "bolt/cudf/exec/CudfAggregation.h"
+#include "bolt/cudf/exec/CudfAssignUniqueId.h"
+#include "bolt/cudf/exec/CudfBatchConcat.h"
+#include "bolt/cudf/exec/CudfDistinct.h"
+#include "bolt/cudf/exec/CudfEnforceSingleRow.h"
+#include "bolt/cudf/exec/CudfFilterProject.h"
+#include "bolt/cudf/exec/CudfGroupId.h"
+#include "bolt/cudf/exec/CudfGroupby.h"
+#include "bolt/cudf/exec/CudfHashJoin.h"
+#include "bolt/cudf/exec/CudfLimit.h"
+#include "bolt/cudf/exec/CudfLocalMerge.h"
+#include "bolt/cudf/exec/CudfLocalPartition.h"
+#include "bolt/cudf/exec/CudfMarkDistinct.h"
+#include "bolt/cudf/exec/CudfNestedLoopJoin.h"
+#include "bolt/cudf/exec/CudfOrderBy.h"
+#include "bolt/cudf/exec/CudfReduce.h"
+#include "bolt/cudf/exec/CudfTopN.h"
+#include "bolt/cudf/exec/CudfTopNRowNumber.h"
+#include "bolt/cudf/exec/CudfWindow.h"
+#include "bolt/cudf/exec/OperatorAdapters.h"
+#include "bolt/cudf/exec/Utilities.h"
+#include "bolt/cudf/exec/Validation.h"
+#include "bolt/cudf/exec/VeloxCudfInterop.h"
+#include "bolt/cudf/expression/ExpressionEvaluator.h"
+#ifdef BOLT_ENABLE_UCX_EXCHANGE
+#include "bolt/experimental/ucx-exchange/UcxExchange.h"
+#include "bolt/experimental/ucx-exchange/UcxPartitionedOutput.h"
+#endif
+
+#include "bolt/common/memory/Memory.h"
+#include "bolt/cudf/compat/ConnectorRegistry.h"
+#include "bolt/connectors/hive/TableHandle.h"
+#include "bolt/exec/AssignUniqueId.h"
+#include "bolt/exec/CallbackSink.h"
+#include "bolt/exec/EnforceSingleRow.h"
+#include "bolt/exec/FilterProject.h"
+#include "bolt/exec/GroupId.h"
+#include "bolt/exec/HashAggregation.h"
+#include "bolt/exec/HashBuild.h"
+#include "bolt/exec/HashProbe.h"
+#include "bolt/exec/Limit.h"
+#include "bolt/exec/LocalPartition.h"
+#include "bolt/exec/MarkDistinct.h"
+#include "bolt/exec/Merge.h"
+#include "bolt/exec/NestedLoopJoinBuild.h"
+#include "bolt/exec/NestedLoopJoinProbe.h"
+#include "bolt/exec/OrderBy.h"
+#include "bolt/exec/PartitionedOutput.h"
+#include "bolt/exec/StreamingAggregation.h"
+#include "bolt/exec/TableScan.h"
+#include "bolt/exec/Task.h"
+#include "bolt/exec/TopN.h"
+#include "bolt/exec/TopNRowNumber.h"
+#include "bolt/exec/Values.h"
+#include "bolt/exec/Window.h"
+
+namespace bytedance::bolt::cudf_velox {
+
+namespace {
+
+bool containsCustomComparison(const TypePtr& type) {
+  if (false) {
+    return true;
+  }
+  for (size_t i = 0; i < type->size(); ++i) {
+    if (containsCustomComparison(type->childAt(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool containsCustomComparison(const core::TypedExprPtr& expression) {
+  if (containsCustomComparison(expression->type())) {
+    return true;
+  }
+  return std::any_of(
+      expression->inputs().begin(),
+      expression->inputs().end(),
+      [](const auto& input) { return containsCustomComparison(input); });
+}
+
+bool subtreeHasUnsupportedType(const core::PlanNodePtr& root) {
+  return core::PlanNode::findFirstNode(root.get(), [](const auto* node) {
+           return !isTypeSupportedByCudf(node->outputType());
+         }) != nullptr;
+}
+
+} // namespace
+
+/// OperatorAdapterRegistry Implementation
+OperatorAdapterRegistry& OperatorAdapterRegistry::getInstance() {
+  static OperatorAdapterRegistry instance;
+  return instance;
+}
+
+void OperatorAdapterRegistry::registerAdapter(
+    std::unique_ptr<OperatorAdapter> adapter) {
+  adapters_.push_back(std::move(adapter));
+}
+
+void OperatorAdapterRegistry::registerAdapterFront(
+    std::unique_ptr<OperatorAdapter> adapter) {
+  adapters_.insert(adapters_.begin(), std::move(adapter));
+}
+
+const OperatorAdapter* OperatorAdapterRegistry::findAdapter(
+    const exec::Operator* op) const {
+  for (const auto& adapter : adapters_) {
+    if (adapter->canHandle(op)) {
+      return adapter.get();
+    }
+  }
+  // Note: It is possible to have priority based adapter search.
+  // But this is not implemented because it is not needed for now.
+  return nullptr;
+}
+
+const std::vector<std::unique_ptr<OperatorAdapter>>&
+OperatorAdapterRegistry::getAdapters() const {
+  return adapters_;
+}
+
+void OperatorAdapterRegistry::clear() {
+  adapters_.clear();
+}
+
+namespace {
+
+// Returns whether legacy_cast leaves a cast from 'source' to 'target' as is: a
+// cast between BOOLEAN, integer, REAL, DOUBLE, DECIMAL and DATE types, or from
+// VARCHAR to DATE or DECIMAL.
+// NOTE: The list is short on purpose. legacy_cast changes how a VARCHAR parses
+// as a TIMESTAMP, how a TIMESTAMP, REAL or DOUBLE prints as a VARCHAR, and
+// whether a VARCHAR with non-ASCII characters casts to an integer.
+bool isLegacyCastIndependent(const TypePtr& source, const TypePtr& target) {
+  const auto isNumberOrDate = [](const TypePtr& type) {
+    return type->isDate() || type->isDecimal() ||
+        (std::string_view(type->name()) == type->kindName() &&
+         (type->isBoolean() || type->isTinyint() || type->isSmallint() ||
+          type->isInteger() || type->isBigint() || type->isReal() ||
+          type->isDouble()));
+  };
+  if (source->isVarchar()) {
+    return target->isDate() || target->isDecimal();
+  }
+  return isNumberOrDate(source) && isNumberOrDate(target);
+}
+
+// Returns whether 'expr' holds a CAST or TRY_CAST that legacy_cast may change.
+bool containsLegacyCastDependentCast(const core::TypedExprPtr& expr) {
+  if (expr->isCastKind() &&
+      !isLegacyCastIndependent(expr->inputs().at(0)->type(), expr->type())) {
+    return true;
+  }
+  return std::any_of(
+      expr->inputs().begin(), expr->inputs().end(), [](const auto& input) {
+        return containsLegacyCastDependentCast(input);
+      });
+}
+
+} // namespace
+
+/// TableScanAdapter - Keeps original operator (produces GPU output)
+class TableScanAdapter : public OperatorAdapter {
+ public:
+  TableScanAdapter() : OperatorAdapter("TableScan") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::TableScan>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx) const override {
+    auto tableScanNode =
+        std::dynamic_pointer_cast<const core::TableScanNode>(planNode);
+    if (!tableScanNode) {
+      LOG_FALLBACK(
+          "TableScan planNode is not TableScanNode, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    auto const& connector = bolt::connector::ConnectorRegistry::tryGet(
+        tableScanNode->tableHandle()->connectorId());
+    auto cudfHiveConnector = std::dynamic_pointer_cast<
+        bytedance::bolt::cudf_velox::connector::hive::CudfHiveConnector>(
+        connector);
+    if (cudfHiveConnector == nullptr) {
+      LOG_FALLBACK(
+          "TableScan connector is not CudfHiveConnector, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    // Ask with the ConnectorQueryCtx the TableScan creates for the connector,
+    // so that this decision matches the data source the connector picks.
+    // unsupportedReason() allocates only from the operator pool, so no
+    // connector pool is needed.
+    const auto connectorQueryCtx = op->operatorCtx()->createConnectorQueryCtx(
+        tableScanNode->tableHandle()->connectorId(),
+        planNode->id(),
+        /*connectorPool=*/nullptr);
+    if (const auto reason = bytedance::bolt::cudf_velox::connector::hive::
+            CudfHiveDataSource::unsupportedReason(
+                tableScanNode->tableHandle(),
+                *connectorQueryCtx,
+                ctx->queryConfig())) {
+      LOG_FALLBACK(
+          "TableScan is not supported by the cuDF data source, PlanNode id: {}: {}",
+          planNode->id(),
+          *reason);
+      return false;
+    }
+
+    // The data source folds the remaining filter without legacy_cast, which
+    // changes how some literals cast, such as a TIMESTAMP literal. The
+    // connector cannot see legacy_cast to fall back, so the scan fails unless
+    // every cast in the filter is one legacy_cast leaves as is.
+    // TODO: Remove this check once the data source folds with the session
+    // QueryConfig (facebookincubator/velox#19476).
+    const auto hiveTableHandle = std::dynamic_pointer_cast<
+        const bolt::connector::hive::HiveTableHandle>(
+        tableScanNode->tableHandle());
+    BOLT_CHECK_NOT_NULL(hiveTableHandle);
+    const auto& remainingFilter = hiveTableHandle->remainingFilter();
+    if (ctx->queryConfig().isLegacyCast() && remainingFilter &&
+        containsLegacyCastDependentCast(remainingFilter)) {
+      BOLT_UNSUPPORTED(
+          "Remaining filter with a cast that legacy_cast may change is not supported by the cuDF data source: {}",
+          remainingFilter->toString());
+    }
+
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {}; // Keep original operator
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+/// FilterProjectAdapter - Replaces with CudfFilterProject
+class FilterProjectAdapter : public OperatorAdapter {
+ public:
+  FilterProjectAdapter() : OperatorAdapter("FilterProject") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::FilterProject>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx) const override {
+    auto filterProjectOp = op->as<exec::FilterProject>();
+    if (!filterProjectOp) {
+      LOG_FALLBACK(
+          "FilterProjectAdapter operator is not FilterProject, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    auto projectPlanNode =
+        std::dynamic_pointer_cast<const core::ProjectNode>(planNode);
+    auto filterNode = filterProjectOp->filterNode();
+
+    // cuDF sizes an expression result from an input column. Over a
+    // zero-column input a filter has nothing to evaluate against, and only
+    // constant projections, which CudfFilterProject fills to the row count
+    // of each batch, can run. A FilterNode keeps its input type, so the
+    // source of 'planNode' gives the input type of a fused FilterProject too.
+    const auto& inputType = planNode->sources()[0]->outputType();
+    if (inputType->size() == 0) {
+      if (filterNode) {
+        LOG_FALLBACK(
+            "FilterProject filter over a zero-column input, PlanNode id: {}",
+            planNode->id());
+        return false;
+      }
+      if (projectPlanNode &&
+          !std::all_of(
+              projectPlanNode->projections().begin(),
+              projectPlanNode->projections().end(),
+              [&](const auto& projection) {
+                return isConstantProjectionOverZeroColumns(
+                    inputType, projection);
+              })) {
+        LOG_FALLBACK(
+            "FilterProject non-constant projection over a zero-column input, PlanNode id: {}",
+            planNode->id());
+        return false;
+      }
+    }
+
+    // Check filter separately
+    if (filterNode) {
+      if (!canExprRunOnGpu(
+              filterNode->filter(), ctx->task->queryCtx().get(), op->pool())) {
+        LOG_FALLBACK(
+            "FilterProject filter cannot be evaluated by cuDF, PlanNode id: {}",
+            planNode->id());
+        return false;
+      }
+    }
+
+    // Check projects separately
+    if (projectPlanNode) {
+      for (const auto& projection : projectPlanNode->projections()) {
+        if (!canExprRunOnGpu(
+                projection, ctx->task->queryCtx().get(), op->pool())) {
+          LOG_FALLBACK(
+              "FilterProject projections cannot be evaluated by cuDF, PlanNode id: {}",
+              planNode->id());
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto filterProjectOp = op->as<exec::FilterProject>();
+    auto projectPlanNode =
+        std::dynamic_pointer_cast<const core::ProjectNode>(planNode);
+    auto filterPlanNode = filterProjectOp->filterNode();
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfFilterProject>(
+            operatorId, ctx, filterPlanNode, projectPlanNode));
+    return result;
+  }
+};
+
+/// AggregationAdapter - Replaces with CudfGroupby, CudfDistinct, or CudfReduce
+class AggregationAdapter : public OperatorAdapter {
+ public:
+  AggregationAdapter() : OperatorAdapter("Aggregation") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::HashAggregation>() ||
+        op->is<exec::StreamingAggregation>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx) const override {
+    if (!canHandle(op)) {
+      LOG_FALLBACK(
+          "Aggregation op is not HashAggregation or StreamingAggregation, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    auto aggregationPlanNode =
+        std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
+    if (!aggregationPlanNode) {
+      LOG_FALLBACK(
+          "Aggregation planNode is not AggregationNode, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    bool canEvaluate = canBeEvaluatedByCudf(
+        *aggregationPlanNode, ctx->task->queryCtx().get(), op->pool());
+    if (!canEvaluate) {
+      LOG_FALLBACK(
+          "Aggregation aggregation cannot be evaluated by cuDF, PlanNode id: {}",
+          planNode->id());
+    }
+    return canEvaluate;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto aggregationPlanNode =
+        std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
+
+    bool isGlobal = aggregationPlanNode->groupingKeys().empty();
+    bool isDistinct = !isGlobal && aggregationPlanNode->aggregates().empty();
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    if (CudfConfig::getInstance().concatOptimizationEnabled) {
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId, ctx, aggregationPlanNode));
+    }
+    if (isGlobal) {
+      result.push_back(
+          std::make_unique<CudfReduce>(operatorId, ctx, aggregationPlanNode));
+    } else if (isDistinct) {
+      result.push_back(
+          std::make_unique<CudfDistinct>(operatorId, ctx, aggregationPlanNode));
+    } else {
+      result.push_back(
+          std::make_unique<CudfGroupby>(operatorId, ctx, aggregationPlanNode));
+    }
+    return result;
+  }
+};
+
+class CudfHashJoinBaseAdapter : public OperatorAdapter {
+ public:
+  using OperatorAdapter::OperatorAdapter;
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx) const override {
+    if (!canHandle(op)) {
+      LOG_FALLBACK(
+          "HashJoin operator is not HashBuild or HashProbe, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
+    if (!joinPlanNode) {
+      LOG_FALLBACK(
+          "HashJoin planNode is not HashJoinNode, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    if (!CudfHashJoinProbe::isSupportedJoinType(joinPlanNode->joinType())) {
+      LOG_FALLBACK(
+          "HashJoin unsupported join type, PlanNode id: {}", planNode->id());
+      return false;
+    }
+
+    // Disabling null-aware anti join with filter until we implement it right
+    if (joinPlanNode->joinType() == core::JoinType::kAnti &&
+        joinPlanNode->isNullAware() && joinPlanNode->filter()) {
+      LOG_FALLBACK(
+          "HashJoin null-aware anti join with filter not implemented, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    if (joinPlanNode->filter()) {
+      if (!canJoinFilterRunOnGpu(
+              joinPlanNode->filter(),
+              ctx->task->queryCtx().get(),
+              op->pool())) {
+        LOG_FALLBACK(
+            "HashJoin join filter cannot be evaluated by cuDF, PlanNode id: {}",
+            planNode->id());
+        return false;
+      }
+    }
+
+    // Reject if any join source has types that cuDF cannot represent.
+    // The probe and build pipelines are compiled independently by ToCudf,
+    // so one side may reject GPU execution (e.g. due to unsupported types)
+    // while the other does not. This check prevents a bridge mismatch
+    // where CudfHashJoinProbe waits for a CudfHashJoinBridge that
+    // CudfHashJoinBuild never populates because it stayed on CPU.
+    if (std::any_of(
+            joinPlanNode->sources().begin(),
+            joinPlanNode->sources().end(),
+            [](const auto& source) {
+              return subtreeHasUnsupportedType(source);
+            })) {
+      LOG_FALLBACK(
+          "HashJoin source has column types unsupported by cuDF, "
+          "PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    return true;
+  }
+};
+
+/// HashJoinBuildAdapter - Replaces with CudfHashJoinBuild
+class HashJoinBuildAdapter : public CudfHashJoinBaseAdapter {
+ public:
+  HashJoinBuildAdapter() : CudfHashJoinBaseAdapter("HashJoinBuild") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::HashBuild>();
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfHashJoinBuild>(operatorId, ctx, joinPlanNode));
+    return result;
+  }
+};
+
+/// HashJoinProbeAdapter - Replaces with CudfHashJoinProbe
+class HashJoinProbeAdapter : public CudfHashJoinBaseAdapter {
+ public:
+  HashJoinProbeAdapter() : CudfHashJoinBaseAdapter("HashJoinProbe") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::HashProbe>();
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    if (CudfConfig::getInstance().concatOptimizationEnabled) {
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(operatorId, ctx, joinPlanNode));
+    }
+    result.push_back(
+        std::make_unique<CudfHashJoinProbe>(operatorId, ctx, joinPlanNode));
+    return result;
+  }
+};
+
+class CudfNestedLoopJoinBaseAdapter : public OperatorAdapter {
+ public:
+  using OperatorAdapter::OperatorAdapter;
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx) const override {
+    if (!canHandle(op)) {
+      return false;
+    }
+
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(planNode);
+    if (!joinPlanNode) {
+      LOG_FALLBACK(
+          "NestedLoopJoin planNode is not NestedLoopJoinNode, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    if (!CudfNestedLoopJoinProbe::isSupportedJoinType(
+            joinPlanNode->joinType())) {
+      LOG_FALLBACK(
+          "NestedLoopJoin unsupported join type: {}, PlanNode id: {}",
+          static_cast<int>(joinPlanNode->joinType()),
+          planNode->id());
+      return false;
+    }
+
+    // Check if join condition can be evaluated on GPU
+    if (joinPlanNode->joinCondition()) {
+      if (containsCustomComparison(joinPlanNode->joinCondition())) {
+        LOG_FALLBACK(
+            "NestedLoopJoin condition has custom comparison semantics, "
+            "PlanNode id: {}",
+            planNode->id());
+        return false;
+      }
+      if (!canJoinFilterRunOnGpu(
+              joinPlanNode->joinCondition(),
+              ctx->task->queryCtx().get(),
+              op->pool())) {
+        LOG_FALLBACK(
+            "NestedLoopJoin filter cannot be evaluated by cuDF, PlanNode id: {}",
+            planNode->id());
+        return false;
+      }
+    }
+
+    // Reject if any join source has types that cuDF cannot represent.
+    // See comment in CudfHashJoinBaseAdapter::canRunOnGPU.
+    if (std::any_of(
+            joinPlanNode->sources().begin(),
+            joinPlanNode->sources().end(),
+            [](const auto& source) {
+              return subtreeHasUnsupportedType(source);
+            })) {
+      LOG_FALLBACK(
+          "NestedLoopJoin source has column types unsupported by cuDF, "
+          "PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    return true;
+  }
+};
+
+/// NestedLoopJoinBuildAdapter - Replaces with CudfNestedLoopJoinBuild
+class NestedLoopJoinBuildAdapter : public CudfNestedLoopJoinBaseAdapter {
+ public:
+  NestedLoopJoinBuildAdapter()
+      : CudfNestedLoopJoinBaseAdapter("NestedLoopJoinBuild") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::NestedLoopJoinBuild>();
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfNestedLoopJoinBuild>(
+            operatorId, ctx, joinPlanNode));
+    return result;
+  }
+};
+
+/// NestedLoopJoinProbeAdapter - Replaces with CudfNestedLoopJoinProbe
+class NestedLoopJoinProbeAdapter : public CudfNestedLoopJoinBaseAdapter {
+ public:
+  NestedLoopJoinProbeAdapter()
+      : CudfNestedLoopJoinBaseAdapter("NestedLoopJoinProbe") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::NestedLoopJoinProbe>();
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfNestedLoopJoinProbe>(
+            operatorId, ctx, joinPlanNode));
+    return result;
+  }
+};
+
+/// OrderByAdapter - Replaces with CudfOrderBy
+class OrderByAdapter : public OperatorAdapter {
+ public:
+  OrderByAdapter() : OperatorAdapter("OrderBy") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::OrderBy>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::OrderByNode>(planNode) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto orderByPlanNode =
+        std::dynamic_pointer_cast<const core::OrderByNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfOrderBy>(operatorId, ctx, orderByPlanNode));
+    return result;
+  }
+};
+
+/// TopNAdapter - Replaces with CudfTopN
+class TopNAdapter : public OperatorAdapter {
+ public:
+  TopNAdapter() : OperatorAdapter("TopN") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::TopN>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::TopNNode>(planNode) != nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto topNPlanNode =
+        std::dynamic_pointer_cast<const core::TopNNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(std::make_unique<CudfTopN>(operatorId, ctx, topNPlanNode));
+    return result;
+  }
+};
+
+/// TopNRowNumberAdapter - Replaces with CudfTopNRowNumber
+class TopNRowNumberAdapter : public OperatorAdapter {
+ public:
+  TopNRowNumberAdapter() : OperatorAdapter("TopNRowNumber") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::TopNRowNumber>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto node =
+        std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
+    if (!node) {
+      return false;
+    }
+    return CudfTopNRowNumber::canRunOnGPU(*node);
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto node =
+        std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfTopNRowNumber>(operatorId, ctx, node));
+    return result;
+  }
+};
+
+/// LimitAdapter - Replaces with CudfLimit
+class LimitAdapter : public OperatorAdapter {
+ public:
+  LimitAdapter() : OperatorAdapter("Limit") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::Limit>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::LimitNode>(planNode) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto limitPlanNode =
+        std::dynamic_pointer_cast<const core::LimitNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfLimit>(operatorId, ctx, limitPlanNode));
+    return result;
+  }
+};
+
+/// LocalPartitionAdapter - Conditionally replaces with CudfLocalPartition
+class LocalPartitionAdapter : public OperatorAdapter {
+ public:
+  LocalPartitionAdapter() : OperatorAdapter("LocalPartition") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::LocalPartition>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto localPartitionPlanNode =
+        std::dynamic_pointer_cast<const core::LocalPartitionNode>(planNode);
+    bool canRun = canHandle(op) && localPartitionPlanNode &&
+        CudfLocalPartition::shouldReplace(localPartitionPlanNode) &&
+        !subtreeHasUnsupportedType(localPartitionPlanNode);
+    if (!canRun) {
+      LOG_FALLBACK(
+          "LocalPartitionAdapter {}, PlanNode id: {}",
+          !canHandle(op) ? "operator is not LocalPartition"
+              : !localPartitionPlanNode
+              ? "planNode is not LocalPartitionNode"
+              : "partition spec or source types are unsupported by cuDF",
+          planNode->id());
+    }
+    return canRun;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto localPartitionPlanNode =
+        std::dynamic_pointer_cast<const core::LocalPartitionNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfLocalPartition>(
+            operatorId, ctx, localPartitionPlanNode));
+    return result;
+  }
+
+  bool keepOperator() const override {
+    return false;
+  }
+};
+
+/// LocalExchangeAdapter - Keeps original operator
+class LocalExchangeAdapter : public OperatorAdapter {
+ public:
+  LocalExchangeAdapter() : OperatorAdapter("LocalExchange") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::LocalExchange>();
+  }
+
+  // LocalExchange consumes whatever the producing pipeline enqueued, so it
+  // only yields device-resident vectors when that pipeline's LocalPartition
+  // was replaced by CudfLocalPartition. Both operators are built from the same
+  // LocalPartitionNode, so the producer's predicate can be evaluated directly
+  // here. Claiming GPU output unconditionally would suppress the CudfFromVelox
+  // insertion in front of downstream GPU operators, which then receive host
+  // RowVectors and fail on the CudfVector cast.
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto localPartitionPlanNode =
+        std::dynamic_pointer_cast<const core::LocalPartitionNode>(planNode);
+    bool canRun = localPartitionPlanNode &&
+        CudfLocalPartition::shouldReplace(localPartitionPlanNode) &&
+        !subtreeHasUnsupportedType(localPartitionPlanNode);
+    if (!canRun) {
+      LOG_FALLBACK(
+          "LocalExchangeAdapter {}, PlanNode id: {}",
+          !localPartitionPlanNode
+              ? "planNode is not LocalPartitionNode"
+              : "partition spec or source types are unsupported by cuDF",
+          planNode->id());
+    }
+    return canRun;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {}; // Keep original operator
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+/// AssignUniqueIdAdapter - Replaces with CudfAssignUniqueId
+class AssignUniqueIdAdapter : public OperatorAdapter {
+ public:
+  AssignUniqueIdAdapter() : OperatorAdapter("AssignUniqueId") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::AssignUniqueId>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::AssignUniqueIdNode>(
+               planNode) != nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto assignUniqueIdPlanNode =
+        std::dynamic_pointer_cast<const core::AssignUniqueIdNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfAssignUniqueId>(
+            operatorId,
+            ctx,
+            assignUniqueIdPlanNode,
+            assignUniqueIdPlanNode->taskUniqueId(),
+            assignUniqueIdPlanNode->uniqueIdCounter()));
+    return result;
+  }
+};
+
+/// ValuesAdapter - Keeps original operator
+class ValuesAdapter : public OperatorAdapter {
+ public:
+  ValuesAdapter() : OperatorAdapter("Values") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::Values>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    LOG_FALLBACK(
+        "Values operator not supported on cuDF, PlanNode id: {}",
+        planNode->id());
+    return false;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {}; // Keep original operator
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+/// MarkDistinctAdapter - Replaces with CudfMarkDistinct
+class MarkDistinctAdapter : public OperatorAdapter {
+ public:
+  MarkDistinctAdapter() : OperatorAdapter("MarkDistinct") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::MarkDistinct>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::MarkDistinctNode>(planNode) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto markDistinctPlanNode =
+        std::dynamic_pointer_cast<const core::MarkDistinctNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfMarkDistinct>(
+            operatorId, ctx, markDistinctPlanNode));
+    return result;
+  }
+};
+
+/// EnforceSingleRowAdapter - Replaces with CudfEnforceSingleRow
+class EnforceSingleRowAdapter : public OperatorAdapter {
+ public:
+  EnforceSingleRowAdapter() : OperatorAdapter("EnforceSingleRow") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::EnforceSingleRow>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::EnforceSingleRowNode>(
+               planNode) != nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto enforceSingleRowPlanNode =
+        std::dynamic_pointer_cast<const core::EnforceSingleRowNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfEnforceSingleRow>(
+            operatorId, ctx, enforceSingleRowPlanNode));
+    return result;
+  }
+};
+
+/// CallbackSinkAdapter - Keeps original operator (accepts GPU input when part
+/// of LocalMergeNode)
+class CallbackSinkAdapter : public OperatorAdapter {
+ public:
+  CallbackSinkAdapter() : OperatorAdapter("CallbackSink") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::CallbackSink>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto supported = planNode &&
+        std::dynamic_pointer_cast<const core::LocalMergeNode>(planNode) !=
+            nullptr &&
+        !subtreeHasUnsupportedType(planNode);
+    if (!supported) {
+      LOG_FALLBACK(
+          "CallbackSink operator not supported on cuDF, PlanNode id: {}",
+          planNode ? planNode->id() : "null");
+    }
+    return supported;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {}; // Keep original operator
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+/// LocalMergeAdapter - Replaces CPU LocalMerge with GPU CudfLocalMerge
+class LocalMergeAdapter : public OperatorAdapter {
+ public:
+  LocalMergeAdapter() : OperatorAdapter("LocalMerge") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::LocalMerge>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return planNode &&
+        std::dynamic_pointer_cast<const core::LocalMergeNode>(planNode) !=
+        nullptr &&
+        !subtreeHasUnsupportedType(planNode);
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto localMergePlanNode =
+        std::dynamic_pointer_cast<const core::LocalMergeNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfLocalMerge>(operatorId, ctx, localMergePlanNode));
+    return result;
+  }
+
+  bool keepOperator() const override {
+    return false;
+  }
+};
+
+/// PartitionedOutputAdapter - Keeps original operator (CPU sink for shuffle)
+class PartitionedOutputAdapter : public OperatorAdapter {
+ public:
+  PartitionedOutputAdapter() : OperatorAdapter("PartitionedOutput") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::PartitionedOutput>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return false;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {}; // Keep original operator
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+// WindowAdapter - Replaces with CudfWindow
+class WindowAdapter : public OperatorAdapter {
+ public:
+  WindowAdapter() : OperatorAdapter("Window") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::Window>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto windowNode =
+        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
+    if (!windowNode) {
+      return false;
+    }
+    std::string reason;
+    if (!CudfWindow::canRunOnGPU(*windowNode, &reason)) {
+      LOG_FALLBACK(
+          "{}, PlanNode id: {}",
+          reason.empty() ? "unknown" : reason,
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto windowPlanNode =
+        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfWindow>(operatorId, ctx, windowPlanNode));
+    return result;
+  }
+};
+
+/// GroupIdAdapter - Replaces with CudfGroupId
+class GroupIdAdapter : public OperatorAdapter {
+ public:
+  GroupIdAdapter() : OperatorAdapter("GroupId") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::GroupId>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::GroupIdNode>(planNode) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto groupIdNode =
+        std::dynamic_pointer_cast<const core::GroupIdNode>(planNode);
+    BOLT_CHECK_NOT_NULL(groupIdNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfGroupId>(operatorId, ctx, groupIdNode));
+    return result;
+  }
+};
+
+#ifdef BOLT_ENABLE_UCX_EXCHANGE
+
+/// UcxExchangeAdapter - Keeps the operator; describes its GPU capabilities and,
+/// for a merge exchange, the sort that follows it.
+///
+/// UcxExchange itself is not a replacement produced here: it is built directly
+/// by the exec::ExchangeTransportEntry registered under
+/// core::TransportKind::kUcx, so by the time the cuDF driver adapter runs, the
+/// operator already exists. Describing it here is what tells CompileState the
+/// operator emits CudfVectors and is not a CPU operator, which keeps it from
+/// being wrapped in conversion operators or reported as a failed replacement.
+///
+/// A core::MergeExchangeNode additionally needs a sort behind the exchange,
+/// because UcxExchangeClient multiplexes every source into one queue and so
+/// destroys the per-source orderings exec::MergeExchange relies on. That sort
+/// is described here rather than built by the transport, so that
+/// DriverFactory::replaceOperators splices it in and renumbers the driver's
+/// operator ids -- one plan node, two operators, consecutive ids.
+class UcxExchangeAdapter : public OperatorAdapter {
+ public:
+  UcxExchangeAdapter() : OperatorAdapter("UcxExchange") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<ucx_exchange::UcxExchange>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    // A source operator; it has no upstream operator in its pipeline.
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    // Inserted after the kept UcxExchange, not in place of it.
+    const auto mergeExchangeNode =
+        std::dynamic_pointer_cast<const core::MergeExchangeNode>(planNode);
+    if (mergeExchangeNode == nullptr) {
+      return {}; // A plain exchange needs no sort.
+    }
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfOrderBy>(operatorId, ctx, mergeExchangeNode));
+    return result;
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+/// UcxPartitionedOutputAdapter - Keeps the operator; describes its GPU
+/// capabilities.
+///
+/// The counterpart of UcxExchangeAdapter for the producer side: the operator
+/// comes from the exec::OutputTransportEntry registered under
+/// core::TransportKind::kUcx, and this adapter only tells CompileState that it
+/// consumes CudfVectors and emits nothing.
+class UcxPartitionedOutputAdapter : public OperatorAdapter {
+ public:
+  UcxPartitionedOutputAdapter() : OperatorAdapter("UcxPartitionedOutput") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<ucx_exchange::UcxPartitionedOutput>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    // Terminal operator: getOutput() always returns nullptr, so no conversion
+    // operator may be appended after it.
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {}; // Keep original operator.
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+#endif // BOLT_ENABLE_UCX_EXCHANGE
+
+/// Registration Function
+void registerAllOperatorAdapters() {
+  auto& registry = OperatorAdapterRegistry::getInstance();
+
+  // Clear any existing adapters
+  registry.clear();
+
+  // Register all adapters
+  registry.registerAdapter(std::make_unique<TableScanAdapter>());
+  registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
+  registry.registerAdapter(std::make_unique<AggregationAdapter>());
+  registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
+  registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
+  registry.registerAdapter(std::make_unique<NestedLoopJoinBuildAdapter>());
+  registry.registerAdapter(std::make_unique<NestedLoopJoinProbeAdapter>());
+  registry.registerAdapter(std::make_unique<OrderByAdapter>());
+  registry.registerAdapter(std::make_unique<TopNAdapter>());
+  registry.registerAdapter(std::make_unique<TopNRowNumberAdapter>());
+  registry.registerAdapter(std::make_unique<LimitAdapter>());
+  registry.registerAdapter(std::make_unique<LocalPartitionAdapter>());
+  registry.registerAdapter(std::make_unique<LocalExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<LocalMergeAdapter>());
+  registry.registerAdapter(std::make_unique<AssignUniqueIdAdapter>());
+  registry.registerAdapter(std::make_unique<MarkDistinctAdapter>());
+  registry.registerAdapter(std::make_unique<EnforceSingleRowAdapter>());
+  registry.registerAdapter(std::make_unique<GroupIdAdapter>());
+  registry.registerAdapter(std::make_unique<ValuesAdapter>());
+  registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());
+  registry.registerAdapter(std::make_unique<PartitionedOutputAdapter>());
+  registry.registerAdapter(std::make_unique<WindowAdapter>());
+#ifdef BOLT_ENABLE_UCX_EXCHANGE
+  registry.registerAdapter(std::make_unique<UcxExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<UcxPartitionedOutputAdapter>());
+#endif
+}
+
+} // namespace bytedance::bolt::cudf_velox

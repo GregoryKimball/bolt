@@ -1372,6 +1372,9 @@ std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
   for (auto& bridgeEntry : splitGroupState.bridges) {
     bridgeEntry.second->start();
   }
+  for (auto& bridgeEntry : splitGroupState.customBridges) {
+    bridgeEntry.second->start();
+  }
 
   // Start all the spill groups before we start the driver execution.
   for (auto& coordinatorEntry : splitGroupState.spillOperatorGroups) {
@@ -1998,8 +2001,8 @@ void Task::addCustomJoinBridgesLocked(
   auto& splitGroupState = splitGroupStates_[splitGroupId];
   for (const auto& planNode : planNodes) {
     if (auto joinBridge = Operator::joinBridgeFromPlanNode(planNode)) {
-      splitGroupState.bridges.emplace(planNode->id(), std::move(joinBridge));
-      return;
+      splitGroupState.customBridges.emplace(
+          planNode->id(), std::move(joinBridge));
     }
   }
 }
@@ -2007,7 +2010,15 @@ void Task::addCustomJoinBridgesLocked(
 std::shared_ptr<JoinBridge> Task::getCustomJoinBridge(
     uint32_t splitGroupId,
     const core::PlanNodeId& planNodeId) {
-  return getJoinBridgeInternal<JoinBridge>(splitGroupId, planNodeId);
+  std::lock_guard<std::timed_mutex> l(mutex_);
+  for (const auto groupId : {splitGroupId, kUngroupedGroupId}) {
+    const auto& customBridges = splitGroupStates_[groupId].customBridges;
+    auto it = customBridges.find(planNodeId);
+    if (it != customBridges.end()) {
+      return it->second;
+    }
+  }
+  return getJoinBridgeInternalLocked<JoinBridge>(splitGroupId, planNodeId);
 }
 
 void Task::addNestedLoopJoinBridgesLocked(
@@ -2204,6 +2215,9 @@ ContinueFuture Task::terminate(TaskState terminalState) {
     // Collect all the join bridges to clear them.
     for (auto& splitGroupState : splitGroupStates_) {
       for (auto& pair : splitGroupState.second.bridges) {
+        oldBridges.emplace_back(std::move(pair.second));
+      }
+      for (auto& pair : splitGroupState.second.customBridges) {
         oldBridges.emplace_back(std::move(pair.second));
       }
       splitGroupStates.push_back(std::move(splitGroupState.second));

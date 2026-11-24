@@ -49,9 +49,9 @@ if(${BOLT_BUILD_TEST_UTILS})
   set(BOLT_TESTUTILS_OBJECT_TARGETS ${BOLT_TESTUTILS_OBJECT_TARGETS} CACHE INTERNAL "")
 endif()
 
+# Without BOLT_ENABLE_PERF, GPerf.cpp provides no-op profiler hooks.
+bolt_add_library(bolt_test_util_gperf OBJECT GPerf.cpp)
 if(${BOLT_ENABLE_PERF})
-  bolt_add_library(bolt_test_util_gperf OBJECT GPerf.cpp)
-
   target_compile_definitions(bolt_test_util_gperf PRIVATE -DBOLT_ENABLE_PERF)
   find_package(gperftools REQUIRED CONFIG)
   target_link_libraries(bolt_test_util_gperf PRIVATE gperftools::profiler)

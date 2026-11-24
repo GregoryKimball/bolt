@@ -319,6 +319,25 @@ const std::string& OperatorCtx::taskId() const {
   return driverCtx_->task->taskId();
 }
 
+bool OperatorCtx::allPeersArrived(
+    ContinueFuture* future,
+    std::vector<ContinuePromise>& promises,
+    std::vector<std::shared_ptr<Operator>>& peerOperators) const {
+  std::vector<std::shared_ptr<Driver>> peerDrivers;
+  if (!driverCtx_->task->allPeersFinished(
+          planNodeId_, driverCtx_->driver, future, promises, peerDrivers)) {
+    return false;
+  }
+
+  peerOperators.reserve(peerDrivers.size());
+  for (const auto& peerDriver : peerDrivers) {
+    auto* peerOperator = peerDriver->findOperator(operatorId_);
+    BOLT_CHECK_EQ(peerOperator->operatorType(), operatorType_);
+    peerOperators.emplace_back(peerDriver, peerOperator);
+  }
+  return true;
+}
+
 int32_t OperatorCtx::getConcurrency() const {
   return driverCtx_->task->getConcurrency();
 }

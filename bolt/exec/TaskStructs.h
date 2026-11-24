@@ -104,6 +104,12 @@ struct SplitGroupState {
   /// Map from the plan node id of the join to the corresponding JoinBridge.
   std::unordered_map<core::PlanNodeId, std::shared_ptr<JoinBridge>> bridges;
 
+  /// Map from the plan node id to the JoinBridge made by a custom
+  /// PlanNodeTranslator. Kept apart from 'bridges' so that a node can have both
+  /// a built-in and a custom bridge.
+  std::unordered_map<core::PlanNodeId, std::shared_ptr<JoinBridge>>
+      customBridges;
+
   /// Map from the plan node id to the associated spill operator group if disk
   /// spill is enabled for the corresponding plan operator.
   std::unordered_map<core::PlanNodeId, std::shared_ptr<SpillOperatorGroup>>
@@ -144,6 +150,7 @@ struct SplitGroupState {
   void clear() {
     if (!mixedExecutionMode) {
       bridges.clear();
+      customBridges.clear();
       spillOperatorGroups.clear();
       barriers.clear();
     }

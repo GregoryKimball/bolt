@@ -1,0 +1,166 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "bolt/cudf/CudfNoDefaults.h"
+#include "bolt/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+
+#include <cudf/io/types.hpp>
+
+#include <folly/Conv.h>
+
+#include <optional>
+#include <string>
+#include <unordered_map>
+
+namespace bytedance::bolt::cudf_velox::connector::hive {
+
+namespace {
+std::string stripFilePrefix(const std::string& targetPath) {
+  const std::string prefix = "file:";
+  if (targetPath.rfind(prefix, 0) == 0) {
+    return targetPath.substr(prefix.length());
+  }
+  return targetPath;
+}
+} // namespace
+
+std::string CudfHiveConnectorSplit::toString() const {
+  return fmt::format("CudfHive: {}", filePath);
+}
+
+std::string CudfHiveConnectorSplit::getFileName() const {
+  const auto i = filePath.rfind('/');
+  return i == std::string::npos ? filePath : filePath.substr(i + 1);
+}
+
+uint64_t CudfHiveConnectorSplit::size() const {
+  return length;
+}
+
+std::optional<int64_t> CudfHiveConnectorSplit::fileSize() const {
+  if (properties.has_value() && properties->fileSize.value_or(-1) >= 0) {
+    return properties->fileSize;
+  }
+  // TODO: Drop the $file_size fallback once Prestissimo's Hive split
+  // conversion fills FileProperties::fileSize.
+  if (const auto it = infoColumns.find("$file_size"); it != infoColumns.end()) {
+    const auto parsed = folly::tryTo<int64_t>(it->second);
+    if (parsed.hasValue() && parsed.value() >= 0) {
+      return parsed.value();
+    }
+  }
+  return std::nullopt;
+}
+
+CudfHiveConnectorSplit::CudfHiveConnectorSplit(
+    const std::string& connectorId,
+    const std::string& _filePath,
+    uint64_t _start,
+    uint64_t _length,
+    int64_t _splitWeight,
+    const std::unordered_map<std::string, std::string>& _infoColumns,
+    const std::unordered_map<std::string, std::optional<std::string>>&
+        _partitionKeys,
+    std::optional<FileProperties> _properties)
+    : bytedance::bolt::connector::ConnectorSplit(connectorId, _splitWeight),
+      filePath(stripFilePrefix(_filePath)),
+      start(_start),
+      length(_length),
+      cudfSourceInfo(std::make_unique<cudf::io::source_info>(filePath)),
+      infoColumns(_infoColumns),
+      partitionKeys(_partitionKeys),
+      properties(std::move(_properties)) {}
+
+// static
+std::shared_ptr<CudfHiveConnectorSplit> CudfHiveConnectorSplit::create(
+    const folly::dynamic& obj) {
+  const auto connectorId = obj["connectorId"].asString();
+  const auto filePath = obj["filePath"].asString();
+  const auto start = static_cast<uint64_t>(obj["start"].asInt());
+  const auto length = static_cast<uint64_t>(obj["length"].asInt());
+  const auto splitWeight = obj["splitWeight"].asInt();
+
+  std::unordered_map<std::string, std::string> infoColumns;
+  for (const auto& [key, value] : obj["infoColumns"].items()) {
+    infoColumns[key.asString()] = value.asString();
+  }
+
+  std::unordered_map<std::string, std::optional<std::string>> partitionKeys;
+  for (const auto& [key, value] : obj["partitionKeys"].items()) {
+    partitionKeys[key.asString()] = value.isNull()
+        ? std::nullopt
+        : std::optional<std::string>(value.asString());
+  }
+
+  std::optional<FileProperties> properties;
+  const auto& propertiesObj = obj.getDefault("properties", nullptr);
+  if (propertiesObj != nullptr) {
+    properties = FileProperties{};
+    if (const auto* size = propertiesObj.get_ptr("fileSize")) {
+      properties->fileSize = size->asInt();
+    }
+    if (const auto* time = propertiesObj.get_ptr("modificationTime")) {
+      properties->modificationTime = time->asInt();
+    }
+  }
+
+  return std::make_shared<CudfHiveConnectorSplit>(
+      connectorId,
+      filePath,
+      start,
+      length,
+      splitWeight,
+      infoColumns,
+      partitionKeys,
+      std::move(properties));
+}
+
+folly::dynamic CudfHiveConnectorSplit::serialize() const {
+  folly::dynamic obj = folly::dynamic::object;
+  obj["connectorId"] = connectorId;
+  obj["filePath"] = filePath;
+  obj["start"] = start;
+  obj["length"] = length;
+  obj["splitWeight"] = splitWeight;
+
+  folly::dynamic infoColumnsObj = folly::dynamic::object;
+  for (const auto& [key, value] : infoColumns) {
+    infoColumnsObj[key] = value;
+  }
+  obj["infoColumns"] = infoColumnsObj;
+
+  folly::dynamic partitionKeysObj = folly::dynamic::object;
+  for (const auto& [key, value] : partitionKeys) {
+    partitionKeysObj[key] =
+        value.has_value() ? folly::dynamic(*value) : folly::dynamic(nullptr);
+  }
+  obj["partitionKeys"] = partitionKeysObj;
+
+  if (properties.has_value()) {
+    folly::dynamic propertiesObj = folly::dynamic::object;
+    if (properties->fileSize.has_value()) {
+      propertiesObj["fileSize"] = *properties->fileSize;
+    }
+    if (properties->modificationTime.has_value()) {
+      propertiesObj["modificationTime"] = *properties->modificationTime;
+    }
+    obj["properties"] = propertiesObj;
+  }
+
+  return obj;
+}
+
+} // namespace bytedance::bolt::cudf_velox::connector::hive

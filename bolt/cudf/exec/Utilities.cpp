@@ -1,0 +1,362 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "bolt/cudf/CudfConfig.h"
+#include "bolt/cudf/CudfNoDefaults.h"
+#include "bolt/cudf/exec/Utilities.h"
+#include "bolt/cudf/exec/VeloxCudfInterop.h"
+
+#include "bolt/common/testutil/TestValue.h"
+
+#include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+namespace bytedance::bolt::cudf_velox {
+namespace {
+
+size_t maxBatchRows() {
+  const auto& cudfConfig = CudfConfig::getInstance();
+  if (cudfConfig.batchSizeMaxThreshold) {
+    BOLT_CHECK_GT(
+        cudfConfig.batchSizeMaxThreshold.value(),
+        0,
+        "cuDF max batch size must be positive");
+    return static_cast<size_t>(cudfConfig.batchSizeMaxThreshold.value());
+  }
+  return static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
+}
+
+vector_size_t checkedVectorSize(size_t rowCount) {
+  BOLT_CHECK_LE(
+      rowCount,
+      static_cast<size_t>(std::numeric_limits<vector_size_t>::max()),
+      "cuDF vector row count exceeds Velox vector size limit");
+  return static_cast<vector_size_t>(rowCount);
+}
+} // namespace
+
+std::unique_ptr<cudf::table> concatenateTables(
+    std::vector<std::unique_ptr<cudf::table>> tables,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  // Check for empty vector
+  BOLT_CHECK_GT(tables.size(), 0);
+
+  if (tables.size() == 1) {
+    return std::move(tables[0]);
+  }
+  std::vector<cudf::table_view> tableViews;
+  tableViews.reserve(tables.size());
+  std::transform(
+      tables.begin(),
+      tables.end(),
+      std::back_inserter(tableViews),
+      [&](const auto& tbl) { return tbl->view(); });
+  return cudf::concatenate(tableViews, stream, mr);
+}
+
+namespace {
+
+std::unique_ptr<cudf::table> makeEmptyTable(
+    const TypePtr& type,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  std::vector<std::unique_ptr<cudf::column>> emptyColumns;
+  emptyColumns.reserve(type->size());
+  for (size_t i = 0; i < type->size(); ++i) {
+    emptyColumns.push_back(makeAllNullColumn(type->childAt(i), 0, stream, mr));
+  }
+  return std::make_unique<cudf::table>(std::move(emptyColumns));
+}
+
+} // namespace
+
+std::unique_ptr<cudf::table> getConcatenatedTable(
+    std::vector<CudfVectorPtr> tables,
+    const TypePtr& tableType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  // Check for empty vector
+  if (tables.size() == 0) {
+    return makeEmptyTable(tableType, stream, mr);
+  }
+
+  auto inputStreams = std::vector<cuda::stream_ref>();
+  auto tableViews = std::vector<cudf::table_view>();
+
+  inputStreams.reserve(tables.size());
+  tableViews.reserve(tables.size());
+
+  for (const auto& table : tables) {
+    BOLT_CHECK_NOT_NULL(table);
+    tableViews.push_back(table->getTableView());
+    inputStreams.push_back(table->stream());
+  }
+
+  cudf::detail::join_streams(inputStreams, stream);
+
+  // Concatenate even a single input so the output is allocated from 'mr'.
+  // Releasing the input in place would return buffers from the producer's
+  // memory resource.
+  auto output = cudf::concatenate(tableViews, stream, mr);
+
+  orderCudfVectorDeallocationsAfterStream(tables, stream);
+  // Input tables are deallocated here when 'tables' goes out of scope.
+  return output;
+}
+
+std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
+    std::vector<CudfVectorPtr> tables,
+    const TypePtr& tableType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  std::vector<std::unique_ptr<cudf::table>> concatTables;
+  // Check for empty vector
+  if (tables.size() == 0) {
+    concatTables.push_back(makeEmptyTable(tableType, stream, mr));
+    return concatTables;
+  }
+
+  std::vector<std::unique_ptr<cudf::table>> outputTables;
+  auto const maxRows = maxBatchRows();
+  size_t start = 0;
+  while (start < tables.size()) {
+    size_t end = start;
+    size_t runningRows = 0;
+    std::vector<cudf::table_view> tableViews;
+    tableViews.reserve(tables.size() - start);
+    while (end < tables.size()) {
+      BOLT_CHECK_NOT_NULL(tables[end]);
+      auto const tableView = tables[end]->getTableView();
+      auto const numRows = static_cast<size_t>(tableView.num_rows());
+      if (runningRows > 0 && runningRows + numRows > maxRows) {
+        break;
+      }
+      runningRows += numRows;
+      tableViews.push_back(tableView);
+      ++end;
+    }
+
+    std::vector<CudfVectorPtr> batch;
+    std::vector<cuda::stream_ref> inputStreams;
+    batch.reserve(end - start);
+    inputStreams.reserve(end - start);
+    for (size_t i = start; i < end; ++i) {
+      batch.push_back(std::move(tables[i]));
+      inputStreams.push_back(batch.back()->stream());
+    }
+
+    cudf::detail::join_streams(inputStreams, stream);
+    outputTables.push_back(cudf::concatenate(tableViews, stream, mr));
+
+    // Rebind deallocation to the output stream, then release this group's
+    // inputs. Each completed output replaces its source inputs, so peak memory
+    // is approximately the original input footprint plus the largest output
+    // batch instead of the full input and output footprints.
+    orderCudfVectorDeallocationsAfterStream(batch, stream);
+    batch.clear();
+
+    size_t retainedInputBatches =
+        std::count_if(tables.begin(), tables.end(), [](const auto& table) {
+          return table != nullptr;
+        });
+    common::testutil::TestValue::adjust(
+        "bytedance::bolt::cudf_velox::getConcatenatedTableBatched::retainedInputBatchesAfterBatchRelease",
+        &retainedInputBatches);
+    start = end;
+  }
+  return outputTables;
+}
+
+std::vector<CudfVectorPtr> getConcatenatedCudfVectorsBatched(
+    memory::MemoryPool* pool,
+    std::vector<CudfVectorPtr>&& vectors,
+    const TypePtr& tableType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  BOLT_CHECK_NOT_NULL(pool);
+
+  std::vector<CudfVectorPtr> outputVectors;
+  if (tableType->size() > 0) {
+    auto tables =
+        getConcatenatedTableBatched(std::move(vectors), tableType, stream, mr);
+    outputVectors.reserve(tables.size());
+    for (auto& table : tables) {
+      BOLT_CHECK_NOT_NULL(table);
+      const auto rowCount =
+          checkedVectorSize(static_cast<size_t>(table->num_rows()));
+      outputVectors.push_back(
+          std::make_shared<CudfVector>(
+              pool, tableType, rowCount, std::move(table), stream));
+    }
+    return outputVectors;
+  }
+
+  size_t remainingRows = 0;
+  for (const auto& vector : vectors) {
+    BOLT_CHECK_NOT_NULL(vector);
+    BOLT_CHECK_EQ(vector->getTableView().num_columns(), 0);
+    const auto rowCount = static_cast<size_t>(vector->size());
+    BOLT_CHECK_LE(
+        rowCount,
+        std::numeric_limits<size_t>::max() - remainingRows,
+        "zero-column cuDF vector row count overflow");
+    remainingRows += rowCount;
+  }
+
+  const auto maxRows = maxBatchRows();
+  do {
+    const auto chunkRows = std::min(remainingRows, maxRows);
+    outputVectors.push_back(
+        std::make_shared<CudfVector>(
+            pool,
+            tableType,
+            checkedVectorSize(chunkRows),
+            makeEmptyTable(tableType, stream, mr),
+            stream));
+    remainingRows -= chunkRows;
+  } while (remainingRows > 0);
+
+  return outputVectors;
+}
+
+void streamsWaitForStream(
+    CudaEvent& event,
+    std::span<const cuda::stream_ref> streams,
+    cuda::stream_ref stream) {
+  event.recordFrom(stream);
+  for (const auto& strm : streams) {
+    event.waitOn(strm);
+  }
+}
+
+CudaEvent::CudaEvent(unsigned int flags) {
+  cudaEvent_t ev{};
+  CUDF_CUDA_TRY(cudaEventCreateWithFlags(&ev, flags));
+  event_ = ev;
+}
+
+CudaEvent::~CudaEvent() {
+  if (event_ != nullptr) {
+    cudaEventDestroy(event_);
+    event_ = nullptr;
+  }
+}
+
+CudaEvent::CudaEvent(CudaEvent&& other) noexcept : event_(other.event_) {
+  other.event_ = nullptr;
+}
+
+const CudaEvent& CudaEvent::recordFrom(cuda::stream_ref stream) const {
+  CUDF_CUDA_TRY(cudaEventRecord(event_, stream.get()));
+  return *this;
+}
+
+const CudaEvent& CudaEvent::waitOn(cuda::stream_ref stream) const {
+  CUDF_CUDA_TRY(cudaStreamWaitEvent(stream.get(), event_, 0));
+  return *this;
+}
+
+const CudaEvent& CudaEvent::synchronize() const {
+  CUDF_CUDA_TRY(cudaEventSynchronize(event_));
+  return *this;
+}
+
+std::string getBaseFunctionName(const std::string& fullName) {
+  auto pos = fullName.rfind('.');
+  return pos == std::string::npos ? fullName : fullName.substr(pos + 1);
+}
+
+std::string stripFunctionPrefix(
+    const std::string& name,
+    const std::string& prefix) {
+  auto base = getBaseFunctionName(name);
+  if (!prefix.empty() && base.find(prefix) == 0) {
+    return base.substr(prefix.size());
+  }
+  return base;
+}
+
+std::unique_ptr<cudf::column> makeAllNullColumn(
+    const TypePtr& type,
+    cudf::size_type numRows,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  switch (type->kind()) {
+    case TypeKind::ARRAY: {
+      // LIST: zeroed offsets (numRows + 1 zeros) + empty child + ALL_NULL mask.
+      cudf::numeric_scalar<int32_t> zeroScalar{0, true, stream, get_temp_mr()};
+      auto offsets =
+          cudf::make_column_from_scalar(zeroScalar, numRows + 1, stream, mr);
+      auto child = makeAllNullColumn(type->childAt(0), 0, stream, mr);
+      auto nullMask = cudf::create_null_mask(
+          numRows,
+          cudf::mask_state::ALL_NULL,
+          stream,
+          cudf::memory_resources{mr, get_temp_mr()});
+      return cudf::make_lists_column(
+          numRows,
+          std::move(offsets),
+          std::move(child),
+          numRows,
+          std::move(nullMask));
+    }
+    case TypeKind::ROW: {
+      // STRUCT: recursively create all-null children + ALL_NULL mask.
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.reserve(type->size());
+      for (size_t i = 0; i < type->size(); ++i) {
+        children.push_back(
+            makeAllNullColumn(type->childAt(i), numRows, stream, mr));
+      }
+      auto nullMask = cudf::create_null_mask(
+          numRows,
+          cudf::mask_state::ALL_NULL,
+          stream,
+          cudf::memory_resources{mr, get_temp_mr()});
+      return cudf::make_structs_column(
+          numRows,
+          std::move(children),
+          numRows,
+          std::move(nullMask),
+          stream,
+          mr);
+    }
+    default: {
+      // Flat types (including STRING): use the scalar approach.
+      auto cudfType = tryVeloxToCudfDataType(type);
+      BOLT_NYI_CHECK(
+          cudfType,
+          "All-null column creation is not implemented for type {}",
+          type->toString());
+      auto nullScalar = cudf::make_default_constructed_scalar(
+          *cudfType, stream, get_temp_mr());
+      return cudf::make_column_from_scalar(*nullScalar, numRows, stream, mr);
+    }
+  }
+}
+
+} // namespace bytedance::bolt::cudf_velox

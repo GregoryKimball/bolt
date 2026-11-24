@@ -1,0 +1,397 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "bolt/cudf/CudfConfig.h"
+#include "bolt/cudf/CudfNoDefaults.h"
+#include "bolt/cudf/exec/CudfFilterProject.h"
+#include "bolt/cudf/exec/GpuResources.h"
+#include "bolt/cudf/exec/Validation.h"
+#include "bolt/cudf/exec/VeloxCudfInterop.h"
+#include "bolt/cudf/expression/AstUtils.h"
+#include "bolt/cudf/expression/ExpressionEvaluator.h"
+#include "bolt/cudf/vector/CudfVector.h"
+
+#include "bolt/common/memory/Memory.h"
+#include "bolt/core/Expressions.h"
+#include "bolt/expression/ExprOptimizer.h"
+
+#include <cudf/aggregation.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/unary.hpp>
+
+#include <algorithm>
+#include <iostream>
+#include <unordered_map>
+
+namespace bytedance::bolt::cudf_velox {
+
+namespace {
+
+void debugPrintTree(
+    const core::TypedExprPtr& expr,
+    int indent = 0,
+    std::ostream& os = std::cout) {
+  if (indent == 0)
+    os << "=== Expression Tree ===" << std::endl;
+  os << std::string(indent, ' ') << typeid(*expr).name()
+     << "(" << expr->type()->toString() << ")" << std::endl;
+  for (auto& input : expr->inputs()) {
+    debugPrintTree(input, indent + 2, os);
+  }
+}
+
+bool checkAddIdentityProjection(
+    const core::TypedExprPtr& projection,
+    const RowTypePtr& inputType,
+    column_index_t outputChannel,
+    std::vector<IdentityProjection>& identityProjections) {
+  if (auto field = core::TypedExprs::asFieldAccess(projection)) {
+    const auto& inputs = field->inputs();
+    if (inputs.empty() ||
+        (inputs.size() == 1 &&
+         dynamic_cast<const core::InputTypedExpr*>(inputs[0].get()))) {
+      const auto inputChannel = inputType->getChildIdx(field->name());
+      identityProjections.emplace_back(inputChannel, outputChannel);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Split stats to attrbitute cardinality reduction to the Filter node.
+std::vector<exec::OperatorStats> splitStats(
+    const exec::OperatorStats& combinedStats,
+    const core::PlanNodeId& filterNodeId) {
+  exec::OperatorStats filterStats;
+
+  filterStats.operatorId = combinedStats.operatorId;
+  filterStats.pipelineId = combinedStats.pipelineId;
+  filterStats.planNodeId = filterNodeId;
+  filterStats.operatorType = combinedStats.operatorType;
+  filterStats.numDrivers = combinedStats.numDrivers;
+
+  filterStats.inputBytes = combinedStats.inputBytes;
+  filterStats.inputPositions = combinedStats.inputPositions;
+  filterStats.inputVectors = combinedStats.inputVectors;
+
+  // Estimate Filter's output bytes based on cardinality change.
+  const double filterRate = combinedStats.inputPositions > 0
+      ? (combinedStats.outputPositions * 1.0 / combinedStats.inputPositions)
+      : 1.0;
+
+  filterStats.outputBytes = (uint64_t)(filterStats.inputBytes * filterRate);
+  filterStats.outputPositions = combinedStats.outputPositions;
+  filterStats.outputVectors = combinedStats.outputVectors;
+
+  auto projectStats = combinedStats;
+  projectStats.inputBytes = filterStats.outputBytes;
+  projectStats.inputPositions = filterStats.outputPositions;
+  projectStats.inputVectors = filterStats.outputVectors;
+
+  return {std::move(projectStats), std::move(filterStats)};
+}
+
+} // namespace
+
+CudfFilterProject::CudfFilterProject(
+    int32_t operatorId,
+    bolt::exec::DriverCtx* driverCtx,
+    const std::shared_ptr<const core::FilterNode>& filter,
+    const std::shared_ptr<const core::ProjectNode>& project)
+    : CudfOperatorBase(
+          operatorId,
+          driverCtx,
+          project ? project->outputType() : filter->outputType(),
+          project ? project->id() : filter->id(),
+          "CudfFilterProject",
+          nvtx3::rgb{220, 20, 60}, // Crimson
+          NvtxMethodFlag::kAll,
+          std::nullopt,
+          project ? std::static_pointer_cast<const core::PlanNode>(project)
+                  : std::static_pointer_cast<const core::PlanNode>(filter)),
+      hasFilter_(filter != nullptr),
+      project_(project),
+      filter_(filter) {
+  if (filter_ != nullptr && project_ != nullptr) {
+    folly::Synchronized<exec::OperatorStats>& opStats = Operator::stats();
+    opStats.withWLock([&](auto& stats) {
+      stats.setStatSplitter(
+          [filterId = filter_->id()](const auto& combinedStats) {
+            return splitStats(combinedStats, filterId);
+          });
+    });
+  }
+}
+
+bool isConstantProjectionOverZeroColumns(
+    const RowTypePtr& inputType,
+    const core::TypedExprPtr& projection) {
+  return inputType->size() == 0 && projection->isConstantKind();
+}
+
+void CudfFilterProject::initialize() {
+  Operator::initialize();
+
+  std::vector<core::TypedExprPtr> allExprs;
+  if (hasFilter_) {
+    BOLT_CHECK_NOT_NULL(filter_);
+    allExprs.push_back(filter_->filter());
+  }
+
+  if (project_) {
+    const auto& inputType = project_->sources()[0]->outputType();
+
+    for (column_index_t i = 0; i < project_->projections().size(); i++) {
+      auto& projection = project_->projections()[i];
+      if (isConstantProjectionOverZeroColumns(inputType, projection)) {
+        // There is no input column to size an expression result from, so the
+        // constant is kept as a scalar and filled to the row count of each
+        // batch in project(). The scalar is cast once to the type the pipeline
+        // carries, e.g. INT64 for an INTERVAL DAY TO SECOND duration.
+        auto scalar =
+            makeScalarFromConstantExpr(projection, operatorCtx_->pool());
+        const auto type = veloxToCudfDataType(projection->type());
+        if (scalar->type() != type) {
+          auto stream = getDefaultStreamForCurrentThread();
+          auto column =
+              cudf::make_column_from_scalar(*scalar, 1, stream, get_temp_mr());
+          column = cudf::cast(column->view(), type, stream, get_temp_mr());
+          scalar = cudf::get_element(column->view(), 0, stream, get_temp_mr());
+          stream.sync();
+        }
+        constantProjections_.emplace_back(i, std::move(scalar));
+        continue;
+      }
+      bool identityProjection = checkAddIdentityProjection(
+          projection, inputType, i, identityProjections_);
+      if (!identityProjection) {
+        allExprs.push_back(projection);
+        resultProjections_.emplace_back(allExprs.size() - 1, i);
+      }
+    }
+  } else {
+    for (column_index_t i = 0; i < outputType_->size(); ++i) {
+      identityProjections_.emplace_back(i, i);
+    }
+    isIdentityProjection_ = true;
+  }
+
+  auto lazyDereference =
+false;
+  BOLT_CHECK(!(lazyDereference && filter_));
+
+  const auto inputType = project_ ? project_->sources()[0]->outputType()
+                                  : filter_->sources()[0]->outputType();
+
+  // convert to AST
+  if (CudfConfig::getInstance().debugEnabled) {
+    int i = 0;
+    for (const auto& expr : allExprs) {
+      LOG(INFO) << "expr[" << i++ << "] " << expr->toString();
+      debugPrintTree(expr, 0, LOG(INFO));
+    }
+  }
+  // Optimize (rewrites + constant folding) each expression before evaluator
+  // selection so CudfFunctions never see scalar-only operand sets, then
+  // compile. The operator pool owns the folded constants for the evaluator's
+  // lifetime.
+  auto* const queryCtx = operatorCtx_->execCtx()->queryCtx();
+  auto* const pool = operatorCtx_->pool();
+  const auto optimizeAndCompile =
+      [inputType, queryCtx, pool](const core::TypedExprPtr& expr) {
+        return createCudfExpression(
+            expression::optimize(expr, queryCtx, pool),
+            inputType,
+            pool,
+            queryCtx->queryConfig());
+      };
+  if (hasFilter_) {
+    // First expr is Filter, rest are Project.
+    filterEvaluator_ = optimizeAndCompile(allExprs.front());
+    std::transform(
+        allExprs.begin() + 1,
+        allExprs.end(),
+        std::back_inserter(projectEvaluators_),
+        optimizeAndCompile);
+  } else {
+    std::transform(
+        allExprs.begin(),
+        allExprs.end(),
+        std::back_inserter(projectEvaluators_),
+        optimizeAndCompile);
+  }
+
+  filter_.reset();
+  project_.reset();
+}
+
+void CudfFilterProject::doAddInput(RowVectorPtr input) {
+  input_ = std::move(input);
+}
+
+RowVectorPtr CudfFilterProject::doGetOutput() {
+  if (allInputProcessed()) {
+    return nullptr;
+  }
+  if (input_->size() == 0) {
+    input_.reset();
+    return nullptr;
+  }
+
+  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
+  BOLT_CHECK_NOT_NULL(cudfInput);
+  auto stream = cudfInput->stream();
+  auto inputTableColumns = cudfInput->release()->release();
+  auto outputSize = input_->size();
+
+  if (hasFilter_) {
+    filter(inputTableColumns, stream);
+  }
+  if (!inputTableColumns.empty()) {
+    outputSize = inputTableColumns.front()->size();
+  }
+  auto outputColumns = project(inputTableColumns, outputSize, stream);
+
+  auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
+  auto const numColumns = outputTable->num_columns();
+  auto const size = numColumns > 0 ? outputTable->num_rows() : outputSize;
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "cudfProject Output: " << size << " rows, " << numColumns
+            << " columns";
+  }
+  if (size == 0) {
+    input_.reset();
+    return nullptr;
+  }
+  auto cudfOutput = std::make_shared<CudfVector>(
+      input_->pool(), outputType_, size, std::move(outputTable), stream);
+  input_.reset();
+  return cudfOutput;
+}
+
+void CudfFilterProject::filter(
+    std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
+    cuda::stream_ref stream) {
+  // Evaluate the Filter
+  std::vector<cudf::column_view> inputViews;
+  inputViews.reserve(inputTableColumns.size());
+  for (auto& col : inputTableColumns) {
+    inputViews.push_back(col->view());
+  }
+  auto filterColumn =
+      filterEvaluator_->eval(inputViews, stream, get_temp_mr(), true);
+  auto filterColumnView = asView(filterColumn);
+  bool shouldApplyFilter = [&]() {
+    if (filterColumnView.has_nulls()) {
+      return true;
+    }
+    // check if all values in filterColumnView are true
+    auto isAllTrue = cudf::reduce(
+        filterColumnView,
+        *cudf::make_all_aggregation<cudf::reduce_aggregation>(),
+        cudf::data_type(cudf::type_id::BOOL8),
+        stream,
+        get_temp_mr());
+    using ScalarType = cudf::scalar_type_t<bool>;
+    auto result = static_cast<ScalarType*>(isAllTrue.get());
+    // If filter is not all true, apply the filter
+    return !(result->is_valid(stream) && result->value(stream));
+  }();
+  if (shouldApplyFilter) {
+    auto filterTable =
+        std::make_unique<cudf::table>(std::move(inputTableColumns));
+    auto filteredTable = cudf::apply_retention_mask(
+        *filterTable, filterColumnView, stream, get_output_mr());
+    inputTableColumns = filteredTable->release();
+  }
+}
+
+std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
+    std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
+    cudf::size_type numRows,
+    cuda::stream_ref stream) {
+  std::vector<cudf::column_view> inputViews;
+  inputViews.reserve(inputTableColumns.size());
+  for (auto& col : inputTableColumns) {
+    inputViews.push_back(col->view());
+  }
+  std::vector<ColumnOrView> columns;
+  for (auto& projectEvaluator : projectEvaluators_) {
+    columns.push_back(
+        projectEvaluator->eval(inputViews, stream, get_output_mr(), true));
+  }
+
+  // Rearrange columns to match outputType_
+  std::vector<std::unique_ptr<cudf::column>> outputColumns(outputType_->size());
+  // Constant projections of a zero-column input.
+  for (const auto& [outputChannel, scalar] : constantProjections_) {
+    outputColumns[outputChannel] = cudf::make_column_from_scalar(
+        *scalar, numRows, stream, get_output_mr());
+  }
+  // computed resultProjections
+  for (int i = 0; i < resultProjections_.size(); i++) {
+    auto& columnOrView = columns[i];
+    if (std::holds_alternative<std::unique_ptr<cudf::column>>(columnOrView)) {
+      // Move the owned column
+      outputColumns[resultProjections_[i].outputChannel] =
+          std::move(std::get<std::unique_ptr<cudf::column>>(columnOrView));
+    } else {
+      // Materialize the column_view into an owned column
+      auto view = std::get<cudf::column_view>(columnOrView);
+      outputColumns[resultProjections_[i].outputChannel] =
+          std::make_unique<cudf::column>(view, stream, get_output_mr());
+    }
+  }
+
+  // Count occurrences of each inputChannel, and move columns if they occur only
+  // once
+  std::unordered_map<column_index_t, int> inputChannelCount;
+  for (const auto& identity : identityProjections_) {
+    inputChannelCount[identity.inputChannel]++;
+  }
+
+  // identityProjections (input to output copy)
+  for (auto const& identity : identityProjections_) {
+    BOLT_CHECK_NOT_NULL(inputTableColumns[identity.inputChannel]);
+    if (inputChannelCount[identity.inputChannel] == 1) {
+      // Move the column if it occurs only once
+      outputColumns[identity.outputChannel] =
+          std::move(inputTableColumns[identity.inputChannel]);
+    } else {
+      // Otherwise, copy the column and decrement the count
+      outputColumns[identity.outputChannel] = std::make_unique<cudf::column>(
+          *inputTableColumns[identity.inputChannel], stream, get_output_mr());
+    }
+    BOLT_CHECK_GT(inputChannelCount[identity.inputChannel], 0);
+    inputChannelCount[identity.inputChannel]--;
+  }
+
+  return outputColumns;
+}
+
+bool CudfFilterProject::allInputProcessed() {
+  return !input_;
+}
+
+bool CudfFilterProject::isFinished() {
+  return noMoreInput_ && allInputProcessed();
+}
+
+} // namespace bytedance::bolt::cudf_velox

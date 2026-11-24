@@ -49,6 +49,8 @@ enum TypedExprKind {
   kCast = 7
 };
 
+using ExprKind = TypedExprKind;
+
 /// Strongly-typed expression, e.g. literal, function call, etc.
 class ITypedExpr : public ISerializable {
  public:
@@ -115,6 +117,49 @@ class ITypedExpr : public ISerializable {
   virtual bool operator==(const ITypedExpr& other) const = 0;
   TypedExprKind typedExprKind() const {
     return exprKind_;
+  }
+
+  TypedExprKind kind() const {
+    return exprKind_;
+  }
+
+  bool isInputKind() const {
+    return exprKind_ == TypedExprKind::kInput;
+  }
+
+  bool isConstantKind() const {
+    return exprKind_ == TypedExprKind::kConstant;
+  }
+
+  bool isCallKind() const {
+    return exprKind_ == TypedExprKind::kCall;
+  }
+
+  bool isFieldAccessKind() const {
+    return exprKind_ == TypedExprKind::kFieldAccess;
+  }
+
+  bool isDereferenceKind() const {
+    return exprKind_ == TypedExprKind::kDereference;
+  }
+
+  bool isConcatKind() const {
+    return exprKind_ == TypedExprKind::kConcat;
+  }
+
+  bool isLambdaKind() const {
+    return exprKind_ == TypedExprKind::kLambda;
+  }
+
+  bool isCastKind() const {
+    return exprKind_ == TypedExprKind::kCast;
+  }
+
+  /// Downcasts to a concrete expression type the caller has already checked
+  /// with one of the is*Kind() methods.
+  template <typename T>
+  const T* asUnchecked() const {
+    return static_cast<const T*>(this);
   }
 
   static void registerSerDe();

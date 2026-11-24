@@ -1,0 +1,146 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "bolt/cudf/exec/AggregationRegistry.h"
+#include "bolt/cudf/exec/PrestoAggregateFunctions.h"
+
+#include "bolt/expression/FunctionSignature.h"
+
+namespace bytedance::bolt::cudf_velox {
+
+void registerPrestoAggregateFunctions(const std::string& prefix) {
+  using exec::FunctionSignatureBuilder;
+
+  unregisterAggregateFunctions();
+  registerCommonAggregationFunctions(getGroupbyAggregationRegistry(), prefix);
+  registerCommonAggregationFunctions(getReduceAggregationRegistry(), prefix);
+  registerGroupbyOnlyAggregationFunctions(
+      getGroupbyAggregationRegistry(), prefix);
+  registerReduceOnlyAggregationFunctions(
+      getReduceAggregationRegistry(), prefix);
+
+  // Presto (default): SUM(REAL) -> REAL, AVG(REAL) -> REAL.
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "sum",
+      core::AggregationNode::Step::kSingle,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("real")
+          .build());
+  appendReduceAggregationFunctionForStep(
+      prefix + "sum",
+      core::AggregationNode::Step::kSingle,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("real")
+          .build());
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "sum",
+      core::AggregationNode::Step::kPartial,
+      FunctionSignatureBuilder()
+          .returnType("double")
+          .argumentType("real")
+          .build());
+  appendReduceAggregationFunctionForStep(
+      prefix + "sum",
+      core::AggregationNode::Step::kPartial,
+      FunctionSignatureBuilder()
+          .returnType("double")
+          .argumentType("real")
+          .build());
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "sum",
+      core::AggregationNode::Step::kFinal,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("double")
+          .build());
+  appendReduceAggregationFunctionForStep(
+      prefix + "sum",
+      core::AggregationNode::Step::kFinal,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("double")
+          .build());
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "sum",
+      core::AggregationNode::Step::kIntermediate,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("double")
+          .build());
+  appendReduceAggregationFunctionForStep(
+      prefix + "sum",
+      core::AggregationNode::Step::kIntermediate,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("double")
+          .build());
+
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "avg",
+      core::AggregationNode::Step::kSingle,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("real")
+          .build());
+  appendReduceAggregationFunctionForStep(
+      prefix + "avg",
+      core::AggregationNode::Step::kSingle,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("real")
+          .build());
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "avg",
+      core::AggregationNode::Step::kFinal,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("row(double,bigint)")
+          .build());
+  appendReduceAggregationFunctionForStep(
+      prefix + "avg",
+      core::AggregationNode::Step::kFinal,
+      FunctionSignatureBuilder()
+          .returnType("real")
+          .argumentType("row(double,bigint)")
+          .build());
+
+  // array_agg takes any element type the GPU operators convert; the result
+  // type check of the registry validation keeps the other types on the CPU.
+  // The function is grouped only: CudfReduce has no aggregator for it, so the
+  // global form stays on the CPU.
+  auto registerArrayAgg = [&](core::AggregationNode::Step step,
+                              const std::string& argumentType) {
+    appendGroupbyAggregationFunctionForStep(
+        prefix + "array_agg",
+        step,
+        FunctionSignatureBuilder()
+            .typeVariable("T")
+            .returnType("array(T)")
+            .argumentType(argumentType)
+            .build());
+  };
+  registerArrayAgg(core::AggregationNode::Step::kSingle, "T");
+  registerArrayAgg(core::AggregationNode::Step::kPartial, "T");
+  registerArrayAgg(core::AggregationNode::Step::kFinal, "array(T)");
+  registerArrayAgg(core::AggregationNode::Step::kIntermediate, "array(T)");
+  // array_agg honors a FILTER mask on the grouped path, its only one.
+  maskSupportedAggregations(getGroupbyAggregationRegistry())
+      .insert(prefix + "array_agg");
+}
+
+} // namespace bytedance::bolt::cudf_velox

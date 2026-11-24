@@ -243,8 +243,8 @@ class MultiThreadedTaskCursor : public TaskCursorBase {
   explicit MultiThreadedTaskCursor(const CursorParameters& params)
       : TaskCursorBase(
             params,
-            std::make_shared<folly::CPUThreadPoolExecutor>(
-                testExecutorConcurrency())),
+            std::make_shared<folly::CPUThreadPoolExecutor>(std::max<unsigned>(
+                testExecutorConcurrency(), params.maxDrivers))),
         maxDrivers_{params.maxDrivers},
         numConcurrentSplitGroups_{params.numConcurrentSplitGroups},
         numSplitGroups_{params.numSplitGroups} {

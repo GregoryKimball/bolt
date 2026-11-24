@@ -672,7 +672,10 @@ endif()
 
 message("FINAL CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
 
-if(${BOLT_ENABLE_GPU})
+if(BOLT_ENABLE_GPU OR BOLT_ENABLE_CUDF)
+  # nvcc has no C++23 dialect, so CUDA must not inherit the C++ standard.
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED True)
   enable_language(CUDA)
   # Determine CUDA_ARCHITECTURES automatically.
   cmake_policy(SET CMP0104 NEW)
@@ -931,7 +934,18 @@ endif()
 
 if(BOLT_ENABLE_CUDF)
   set(BOLT_ENABLE_ARROW ON)
+  # BOLT_CUDF_PREFIX points at an installed libcudf (with RMM, KvikIO and nvcomp) when it does not
+  # come from Conan.
+  if(BOLT_CUDF_PREFIX)
+    # The Conan toolchain keeps find_package from searching lib64/cmake under a prefix.
+    list(APPEND CMAKE_PREFIX_PATH "${BOLT_CUDF_PREFIX}" "${BOLT_CUDF_PREFIX}/lib64/cmake"
+         "${BOLT_CUDF_PREFIX}/lib/cmake")
+  endif()
   find_package(cudf CONFIG REQUIRED)
+  find_package(nvtx3 CONFIG REQUIRED)
+  # CUDA objects linked by the C++ linker pull in the CUDA runtime by name only.
+  find_package(CUDAToolkit REQUIRED)
+  link_directories(${CUDAToolkit_LIBRARY_DIR})
 endif()
 
 if(${BOLT_ENABLE_SPARK_COMPATIBLE})

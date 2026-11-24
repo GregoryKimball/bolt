@@ -137,6 +137,18 @@ class PlanNode : public ISerializable {
 
   virtual ~PlanNode() {}
 
+  /// Returns true if this node is of type 'T'.
+  template <typename T>
+  bool is() const {
+    return dynamic_cast<const T*>(this) != nullptr;
+  }
+
+  /// Returns this node as 'T', or nullptr if it has a different type.
+  template <typename T>
+  const T* as() const {
+    return dynamic_cast<const T*>(this);
+  }
+
   const PlanNodeId& id() const {
     return id_;
   }

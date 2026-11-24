@@ -30,6 +30,8 @@
 
 #include "bolt/benchmarks/QueryBenchmarkBase.h"
 
+#include <folly/String.h>
+
 DEFINE_string(bolt_benchmark_data_format, "parquet", "Data format");
 
 DEFINE_validator(
@@ -116,6 +118,12 @@ DEFINE_int32(
     bolt_benchmark_split_preload_per_driver,
     2,
     "Prefetch split metadata");
+
+DEFINE_string(
+    bolt_benchmark_query_configs,
+    "",
+    "Semicolon-separated query configs applied to every query, e.g. "
+    "'key1=value1;key2=value2'.");
 using namespace bytedance::bolt::exec;
 using namespace bytedance::bolt::exec::test;
 using namespace bytedance::bolt::dwio::common;
@@ -162,6 +170,20 @@ void QueryBenchmarkBase::printResults(
 }
 
 void QueryBenchmarkBase::initialize() {
+  std::vector<folly::StringPiece> entries;
+  folly::split(';', FLAGS_bolt_benchmark_query_configs, entries);
+  for (const auto& rawEntry : entries) {
+    const auto entry = folly::trimWhitespace(rawEntry);
+    if (entry.empty()) {
+      continue;
+    }
+    const auto pos = entry.find('=');
+    BOLT_USER_CHECK_NE(
+        pos, folly::StringPiece::npos, "Malformed query config: {}", entry);
+    queryConfigs_[folly::trimWhitespace(entry.subpiece(0, pos)).str()] =
+        folly::trimWhitespace(entry.subpiece(pos + 1)).str();
+  }
+
   if (FLAGS_bolt_benchmark_cache_gb) {
     memory::MemoryManager::Options options;
     int64_t memoryBytes = FLAGS_bolt_benchmark_cache_gb * (1LL << 30);
@@ -252,6 +274,7 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       CursorParameters params;
       params.maxDrivers = FLAGS_bolt_benchmark_num_drivers;
       params.planNode = tpchPlan.plan;
+      params.queryConfigs.insert(queryConfigs_.begin(), queryConfigs_.end());
       params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
           std::to_string(FLAGS_bolt_benchmark_split_preload_per_driver);
       const int numSplitsPerFile = FLAGS_bolt_benchmark_num_splits_per_file;

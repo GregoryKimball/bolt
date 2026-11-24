@@ -425,8 +425,3 @@ add_test(
 target_link_libraries(cpr_http_client_test PRIVATE bolt_gtest_main)
 
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/data DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
-
-if(${BOLT_ENABLE_CUDF})
-  target_compile_definitions(bolt_exec_test PRIVATE BOLT_HAS_CUDF=1)
-  target_compile_definitions(bolt_exec_aggregation_test PRIVATE BOLT_HAS_CUDF=1)
-endif()

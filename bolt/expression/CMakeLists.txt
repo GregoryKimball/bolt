@@ -56,6 +56,7 @@ bolt_add_library(
   EvalCtx.cpp
   Expr.cpp
   ExprCompiler.cpp
+  ExprOptimizer.cpp
   ExprToSubfieldFilter.cpp
   FieldReference.cpp
   FunctionCallToSpecialForm.cpp
